@@ -6,10 +6,12 @@
 mod fastlz;
 mod io;
 mod reader;
+mod section;
 mod types;
 
 pub use io::{ReadSignalsError, ReaderError};
 pub use reader::{FstFilter, FstHeader, FstReader, FstSignalValue, is_fst_file};
+pub use section::{FstSection, FstSectionInfo, FstValue};
 pub use types::{
     FstArrayType, FstEnumType, FstHierarchyEntry, FstPackType, FstScopeType, FstSignalHandle,
     FstVarDirection, FstVarType, FstVhdlDataType, FstVhdlVarType,

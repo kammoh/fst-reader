@@ -263,6 +263,44 @@ impl<R: BufRead + Seek> FstReader<R> {
             }
         }
     }
+
+    /// Returns the start and end time of every value-change section, in file order.
+    pub fn sections(&self) -> Vec<crate::FstSectionInfo> {
+        self.meta
+            .data_sections
+            .iter()
+            .map(|s| crate::FstSectionInfo {
+                start_time: s.start_time,
+                end_time: s.end_time,
+            })
+            .collect()
+    }
+
+    /// Reads one value-change section into memory. See [`crate::FstSection`].
+    pub fn read_section(&mut self, index: usize) -> Result<crate::FstSection> {
+        let section = self.meta.data_sections.get(index).cloned().ok_or_else(|| {
+            ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("section index {index} is out of range"),
+            ))
+        })?;
+        let signals = &self.meta.signals;
+        let endian = self.meta.float_endian;
+        match &mut self.input {
+            InputVariant::Original(input) => {
+                crate::section::read_section(input, &section, signals, endian)
+            }
+            InputVariant::Incomplete(input, _) => {
+                crate::section::read_section(input, &section, signals, endian)
+            }
+            InputVariant::UncompressedInMem(input) => {
+                crate::section::read_section(input, &section, signals, endian)
+            }
+            InputVariant::IncompleteUncompressedInMem(input, _) => {
+                crate::section::read_section(input, &section, signals, endian)
+            }
+        }
+    }
 }
 
 pub enum FstSignalValue<'a> {
