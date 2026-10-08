@@ -59,23 +59,32 @@ fn events_from_sections(path: &Path) -> Vec<Event> {
         let section = reader.read_section(index).unwrap();
         let start = section.info().start_time;
         let times = section.time_table().to_vec();
-        // `read_signals` reports the first section's frame at the section start time
-        // when the first time-table entry is later than that.
+        // `read_signals` skips the sections that start after the header end time. It reports
+        // the first section's frame at the section start time when the first time-table entry
+        // is later than that.
+        if start > end_time {
+            continue;
+        }
         if index == 0 && (times.is_empty() || times[0] > start) {
             section
                 .for_each_frame_value(|h, v| out.push((start, h.get_index(), norm(v))))
                 .unwrap();
         }
+        // `read_signals(FstFilter::all())` stops at the first time after the header end time.
+        let kept = times.iter().take_while(|&&t| t <= end_time).count();
+        let Some(last_time_index) = kept.checked_sub(1) else {
+            continue;
+        };
         for idx in 0..section.max_handle() {
             section
-                .for_each_change(FstSignalHandle::from_index(idx), |ti, v| {
-                    out.push((times[ti], idx, norm(v)))
-                })
+                .for_each_change_until(
+                    FstSignalHandle::from_index(idx),
+                    last_time_index,
+                    |ti, v| out.push((times[ti], idx, norm(v))),
+                )
                 .unwrap();
         }
     }
-    // `read_signals(FstFilter::all())` stops after the header end time.
-    out.retain(|(time, _, _)| *time <= end_time);
     out.sort_by_key(|(time, handle, _)| (*time, *handle));
     out
 }
@@ -326,5 +335,20 @@ mod generated {
             .unwrap();
         // The value at time 0 is in the frame, not in the change data.
         assert_eq!(times, vec![10, 20, 30], "for_each_change does not cut");
+
+        // The cutoff at the last time that is not later than the end time gives the cut.
+        let last_time_index = section
+            .time_table()
+            .iter()
+            .take_while(|&&t| t <= 20)
+            .count()
+            - 1;
+        let mut times = Vec::new();
+        section
+            .for_each_change_until(FstSignalHandle::from_index(0), last_time_index, |ti, _| {
+                times.push(section.time_table()[ti])
+            })
+            .unwrap();
+        assert_eq!(times, vec![10, 20], "for_each_change_until cuts");
     }
 }

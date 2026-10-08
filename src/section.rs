@@ -147,7 +147,8 @@ impl FstSection {
     ///
     /// This method reports every change in the section, including changes after the end time in
     /// the file header. [`crate::FstReader::read_signals`] drops those changes. A caller that
-    /// needs the same result as `read_signals` must apply the same cut.
+    /// needs the same result as `read_signals` must apply the same cut, for example with
+    /// [`FstSection::for_each_change_until`].
     ///
     /// Returns an error if the stored bytes are inconsistent or damaged. For example, a time
     /// index may be outside [`FstSection::time_table`], a value may be cut short, a handle may
@@ -155,6 +156,24 @@ impl FstSection {
     pub fn for_each_change(
         &self,
         handle: FstSignalHandle,
+        f: impl FnMut(usize, FstValue<'_>),
+    ) -> ReadResult<()> {
+        self.for_each_change_until(handle, usize::MAX, f)
+    }
+
+    /// Like [`FstSection::for_each_change`], but stops at the first change with a time index
+    /// greater than `last_time_index`. The decoder reads the time delta of that change, but not
+    /// its value and nothing after it. So damage in the bytes after the cutoff does not cause
+    /// an error. The compressed data of the signal is still decompressed as a whole.
+    ///
+    /// [`crate::FstReader::read_signals`] stops in the same way after the end time in the file
+    /// header. A caller that needs the same result passes the index of the last entry of
+    /// [`FstSection::time_table`] that is not later than the end time. If there is no such
+    /// entry, the caller must not decode the section.
+    pub fn for_each_change_until(
+        &self,
+        handle: FstSignalHandle,
+        last_time_index: usize,
         mut f: impl FnMut(usize, FstValue<'_>),
     ) -> ReadResult<()> {
         let idx = handle.get_index();
@@ -183,6 +202,9 @@ impl FstSection {
                 _ => vli >> 1,
             };
             time_index = time_index.saturating_add(delta as usize);
+            if time_index > last_time_index {
+                return Ok(());
+            }
             if time_index >= self.time_table.len() {
                 return Err(time_index_out_of_range(time_index, self.time_table.len()));
             }
@@ -447,6 +469,82 @@ mod tests {
             })
             .unwrap();
         assert_eq!(seen, vec![(0, b"0000".to_vec())]);
+    }
+
+    /// Time indices of the changes of handle 0 that `for_each_change_until` reports.
+    fn indices_until(section: &FstSection, last_time_index: usize) -> ReadResult<Vec<usize>> {
+        let mut seen = Vec::new();
+        section.for_each_change_until(
+            FstSignalHandle::from_index(0),
+            last_time_index,
+            |ti, _| seen.push(ti),
+        )?;
+        Ok(seen)
+    }
+
+    /// A 2-bit signal with the times 0, 10, 20. The changes are at the indices 0, 1, and 2. The
+    /// last value is cut short: it is a 4-state value (bit 0 of the first byte), which needs two
+    /// characters, but only one follows.
+    fn section_with_a_cut_short_last_value() -> FstSection {
+        section(2, false, 3, &[0x00, 0x00, 0x02, 0x80, 0x03, b'1'])
+    }
+
+    #[test]
+    fn a_cutoff_stops_before_a_value_that_is_cut_short() {
+        let section = section_with_a_cut_short_last_value();
+        // Without a cutoff the section reports the damage.
+        let err = section
+            .for_each_change(FstSignalHandle::from_index(0), |_, _| {})
+            .unwrap_err();
+        assert!(matches!(&err, ReaderError::Io(e) if e.kind() == ErrorKind::UnexpectedEof));
+        // The cutoff at index 1 stops after reading the time delta of the third change.
+        assert_eq!(indices_until(&section, 1).unwrap(), vec![0, 1]);
+        // Also with the cutoff at index 0 and with a cutoff after all changes.
+        assert_eq!(indices_until(&section, 0).unwrap(), vec![0]);
+        assert!(matches!(
+            indices_until(&section, 2).unwrap_err(),
+            ReaderError::Io(e) if e.kind() == ErrorKind::UnexpectedEof
+        ));
+        assert!(indices_until(&section, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn a_cutoff_does_not_change_the_values_before_it() {
+        // 4-bit values, 2-state: delta 0 and 1 and 2, with one byte each.
+        let section = section(4, false, 5, &[0x00, 0x10, 0x02, 0x20, 0x04, 0x30]);
+        let all = changes(&section);
+        assert_eq!(all.len(), 3);
+        for last_time_index in 0..8 {
+            let mut seen = Vec::new();
+            section
+                .for_each_change_until(FstSignalHandle::from_index(0), last_time_index, |ti, v| {
+                    match v {
+                        FstValue::Packed { width, bytes } => {
+                            seen.push((ti, Seen::Packed(width, bytes.to_vec())))
+                        }
+                        other => panic!("expected a packed value, got {other:?}"),
+                    }
+                })
+                .unwrap();
+            let expected: Vec<_> = changes(&section)
+                .into_iter()
+                .filter(|(ti, _)| *ti <= last_time_index)
+                .collect();
+            assert_eq!(seen, expected, "cutoff {last_time_index}");
+        }
+    }
+
+    #[test]
+    fn a_cutoff_before_a_time_index_past_the_table_is_not_an_error() {
+        // The second change is at index 1, but the table has one entry.
+        let mut section = section_with_one_change(4, &[0b1010_0000]);
+        section.data[2] = 0x02;
+        assert_invalid_data(
+            section
+                .for_each_change(FstSignalHandle::from_index(0), |_, _| {})
+                .unwrap_err(),
+        );
+        assert_eq!(indices_until(&section, 0).unwrap(), Vec::<usize>::new());
     }
 
     #[test]
