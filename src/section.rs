@@ -143,8 +143,10 @@ impl FstSection {
     /// the file header. [`crate::FstReader::read_signals`] drops those changes. A caller that
     /// needs the same result as `read_signals` must apply the same cut.
     ///
-    /// Returns an error if the data is corrupt, for example if a time index is not in
-    /// [`FstSection::time_table`].
+    /// Returns an error if the decoded bytes are inconsistent. For example, a time index may be
+    /// outside [`FstSection::time_table`], a value may be cut short, or a handle may have no
+    /// signal information. The decompression helpers shared with `read_signals` can still panic
+    /// on a damaged compressed block.
     pub fn for_each_change(
         &self,
         handle: FstSignalHandle,
@@ -545,7 +547,7 @@ mod tests {
     #[test]
     fn a_handle_without_signal_info_is_an_error() {
         // `locs` has two handles, but `signals` has only one. This cannot come from
-        // `read_section`, which checks it, but a corrupt file must never cause a panic.
+        // `read_section`, which checks it. `for_each_change` must still return an error.
         let mut section = section_with_one_change(4, &[0b1010_0000]);
         section.locs.push(section.locs[0]);
         assert_eq!(section.max_handle(), 2);
