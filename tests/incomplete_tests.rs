@@ -156,6 +156,12 @@ fn frame_values(reader: &mut FstReader<impl BufRead + Seek>) -> Vec<(usize, Stri
     out
 }
 
+fn hierarchy(reader: &mut FstReader<impl BufRead + Seek>) -> Vec<FstHierarchyEntry> {
+    let mut out = Vec::new();
+    reader.read_hierarchy(|entry| out.push(entry)).unwrap();
+    out
+}
+
 #[test]
 fn the_test_file_has_a_variable_length_signal_and_a_usable_time_table() {
     let bytes = complete_file();
@@ -192,4 +198,35 @@ fn a_zero_width_string_variable_is_not_a_real_signal_in_a_rebuilt_geometry() {
     assert_eq!(signal_events(&mut reader, &only_bit), expected_all);
     // The section API gives the same frame values.
     assert_eq!(frame_values(&mut reader), expected_frame);
+}
+
+/// The hierarchy is in the external file. The file has an embedded hierarchy block, which is
+/// compressed and has another offset. The reader must not use the metadata of the embedded
+/// block for the external file.
+#[test]
+fn the_external_hierarchy_is_read_without_the_metadata_of_the_embedded_one() {
+    let bytes = complete_file();
+    let expected = hierarchy(&mut open_complete(&bytes));
+    assert_eq!(expected.len(), 4, "scope, two variables, up-scope");
+
+    // Only the geometry block is missing.
+    let no_geometry = without_blocks(&bytes, &[BLOCK_GEOMETRY]);
+    let mut reader = open_incomplete(&no_geometry);
+    assert_eq!(hierarchy(&mut reader), expected);
+    // The rebuilt geometry is right as well.
+    let mut complete = open_complete(&bytes);
+    assert_eq!(
+        signal_events(&mut reader, &FstFilter::all()),
+        signal_events(&mut complete, &FstFilter::all())
+    );
+}
+
+/// `open_incomplete` always reads the hierarchy from the external file. This also holds if the
+/// file is complete.
+#[test]
+fn the_external_hierarchy_is_read_for_a_complete_file() {
+    let bytes = complete_file();
+    let expected = hierarchy(&mut open_complete(&bytes));
+    let mut reader = open_incomplete(&bytes);
+    assert_eq!(hierarchy(&mut reader), expected);
 }

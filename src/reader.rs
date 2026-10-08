@@ -126,6 +126,9 @@ impl<R: BufRead + Seek> FstReader<R> {
     ///
     /// This function tries to reconstruct these missing blocks from an external `.hier`
     /// file, which is commonly generated while outputting FST files.
+    ///
+    /// The reader always takes the hierarchy from the external file, even if the FST file has
+    /// a hierarchy block of its own.
     pub fn open_incomplete<H: BufRead + Seek + Sync + Send + 'static>(
         input: R,
         hierarchy: H,
@@ -181,13 +184,14 @@ impl<R: BufRead + Seek> FstReader<R> {
         match header_reader.read(read_time_table) {
             Ok(_) => {}
             Err(ReaderError::MissingGeometry() | ReaderError::MissingHierarchy()) => {
-                header_reader
-                    .hierarchy
-                    .get_or_insert((HierarchyCompression::Uncompressed, 0));
                 header_reader.reconstruct_geometry(hierarchy)?;
             }
             Err(e) => return Err(e),
         };
+        // `read_hierarchy` always reads the external file, which is not compressed and starts
+        // at offset 0. The file itself can have a hierarchy block with another compression and
+        // offset. The metadata of that block does not apply to the external file.
+        header_reader.hierarchy = Some((HierarchyCompression::Uncompressed, 0));
         Ok(header_reader.into_input_and_meta_data().unwrap())
     }
 
