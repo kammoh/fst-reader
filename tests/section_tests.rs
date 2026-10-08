@@ -226,6 +226,26 @@ mod generated {
         body.finish().unwrap();
     }
 
+    /// Returns true if the file at `path` has the time table that `case` describes.
+    ///
+    /// fst-writer 0.3.1 stores a zlib-compressed time table as if it were uncompressed when
+    /// both have the same length. Such a file has a wrong time table, so the property test
+    /// skips it. A test for a fixed case must assert this function, so that a change in
+    /// fst-writer or in this guard cannot silently skip the case.
+    fn time_table_matches(path: &Path, case: &Case) -> bool {
+        let mut want = vec![0u64];
+        let mut time = 0;
+        for (delta, _) in &case.steps {
+            time += delta;
+            want.push(time);
+        }
+        let got =
+            FstReader::open_and_read_time_table(BufReader::new(std::fs::File::open(path).unwrap()))
+                .ok()
+                .and_then(|r| r.get_time_table().map(|t| t.to_vec()));
+        got.as_deref() == Some(&want[..])
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(500))]
         #[test]
@@ -233,18 +253,7 @@ mod generated {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("case.fst");
             write(&path, &case);
-            // fst-writer 0.3.1 stores a zlib-compressed time table as if it were uncompressed
-            // when both have the same length. Skip such files.
-            let mut want = vec![0u64];
-            let mut time = 0;
-            for (delta, _) in &case.steps {
-                time += delta;
-                want.push(time);
-            }
-            let got = FstReader::open_and_read_time_table(BufReader::new(std::fs::File::open(&path).unwrap()))
-                .ok()
-                .and_then(|r| r.get_time_table().map(|t| t.to_vec()));
-            prop_assume!(got.as_deref() == Some(&want[..]));
+            prop_assume!(time_table_matches(&path, &case));
             let expected = events_from_read_signals(&path).expect("read_signals failed");
             prop_assert_eq!(events_from_sections(&path), expected);
         }
@@ -266,6 +275,8 @@ mod generated {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("three.fst");
         write(&path, &case);
+        // The property test skips a file without this property, so this case must have it.
+        assert!(time_table_matches(&path, &case));
         let reader = open(&path).unwrap();
         assert_eq!(reader.sections().len(), 3);
         assert_eq!(

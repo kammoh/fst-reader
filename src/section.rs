@@ -10,7 +10,7 @@
 
 use crate::FstSignalHandle;
 use crate::io::{
-    ReadResult, ReaderError, multi_bit_digital_signal_to_chars, read_bytes, read_f64,
+    RCV_STR, ReadResult, ReaderError, multi_bit_digital_signal_to_chars, read_bytes, read_f64,
     read_packed_signal_value_bytes, read_signal_locs, read_time_table, read_u8, read_u64,
     read_variant_u32, read_variant_u64, read_zlib_compressed_bytes,
 };
@@ -20,7 +20,9 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 /// Start and end time of one value-change section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FstSectionInfo {
+    /// The start time of the section, as stored in the section header.
     pub start_time: u64,
+    /// The end time of the section, as stored in the section header.
     pub end_time: u64,
 }
 
@@ -30,8 +32,8 @@ pub enum FstValue<'a> {
     /// A 2-state bit vector of `width` bits in `width.div_ceil(8)` bytes. The most significant
     /// bit is bit 7 of `bytes[0]`. The unused low bits of the last byte are always zero.
     Packed { width: u32, bytes: &'a [u8] },
-    /// A bit vector with one ASCII state character per bit, most significant bit first.
-    /// Used for values with a bit that is not `0` or `1`, and for all frame values.
+    /// The state characters of a bit vector as stored in the file, one per bit, most significant
+    /// bit first. Used when the stored value is not packed 2-state, and for all frame values.
     Chars(&'a [u8]),
     /// A variable-length string value.
     VarLen(&'a [u8]),
@@ -41,8 +43,6 @@ pub enum FstValue<'a> {
 
 const PACKED_ZERO: [u8; 1] = [0x00];
 const PACKED_ONE: [u8; 1] = [0x80];
-/// Same order as the 1-bit 4/9-state codes in `io::one_bit_signal_value_to_char`.
-static ONE_BIT_CHARS: [u8; 8] = *b"xzhuwl-?";
 
 /// One value-change section, read into memory. The value-change data stays compressed until
 /// [`FstSection::for_each_change`] decodes one signal.
@@ -61,6 +61,12 @@ pub struct FstSection {
     float_endian: FloatingPointEndian,
 }
 
+// The section can be shared between threads. A caller decodes different signals in parallel.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<FstSection>();
+};
+
 fn unexpected_eof() -> ReaderError {
     ReaderError::Io(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
@@ -68,10 +74,16 @@ fn unexpected_eof() -> ReaderError {
     ))
 }
 
-fn time_index_out_of_range(time_index: usize, len: usize) -> ReaderError {
+fn invalid_data(message: String) -> ReaderError {
     ReaderError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        format!("time index {time_index} is outside the time table of {len} entries"),
+        message,
+    ))
+}
+
+fn time_index_out_of_range(time_index: usize, len: usize) -> ReaderError {
+    invalid_data(format!(
+        "time index {time_index} is outside the time table of {len} entries"
     ))
 }
 
@@ -85,6 +97,7 @@ fn take<'a>(input: &mut &'a [u8], n: usize) -> ReadResult<&'a [u8]> {
 }
 
 impl FstSection {
+    /// The start and end time of this section.
     pub fn info(&self) -> FstSectionInfo {
         self.info
     }
@@ -141,13 +154,19 @@ impl FstSection {
         let Some((offset, len)) = self.locs.get(idx).copied().flatten() else {
             return Ok(());
         };
+        let &(width, is_real) = self.signals.get(idx).ok_or_else(|| {
+            invalid_data(format!(
+                "signal handle {idx} has changes but no signal information ({} signals)",
+                self.signals.len()
+            ))
+        })?;
         let start = usize::try_from(offset).map_err(|_| unexpected_eof())?;
         let mut input = Cursor::new(self.data.get(start..).ok_or_else(unexpected_eof)?);
         let bytes = read_packed_signal_value_bytes(&mut input, len, self.pack)?;
-        let (width, is_real) = self.signals[idx];
         let mut masked: Vec<u8> = Vec::new();
         let mut chars: Vec<u8> = Vec::new();
         let mut rest: &[u8] = &bytes;
+        let one_bit_chars: &'static [u8; 8] = &RCV_STR;
         let mut time_index = 0usize;
         while !rest.is_empty() {
             let (vli, _) = read_variant_u32(&mut rest)?;
@@ -171,7 +190,7 @@ impl FstSection {
                         FstValue::Packed { width: 1, bytes }
                     } else {
                         let code = ((vli >> 1) & 7) as usize;
-                        FstValue::Chars(&ONE_BIT_CHARS[code..code + 1])
+                        FstValue::Chars(&one_bit_chars[code..code + 1])
                     };
                     f(time_index, value);
                 }
@@ -247,16 +266,45 @@ pub(crate) fn read_section(
 
     // value-change data follows the frame
     let (max_handle, _) = read_variant_u64(input)?;
+    // Every handle needs signal information. This check also keeps a corrupt `max_handle` from
+    // causing a huge allocation.
+    if max_handle > signals.len() as u64 {
+        return Err(invalid_data(format!(
+            "the section has {max_handle} signal handles, but the file has {} signals",
+            signals.len()
+        )));
+    }
     let vc_start = input.stream_position()?;
     let pack = ValueChangePackType::from_u8(read_u8(input)?);
-    let chain_len_offset = section.file_offset + section_length - time_section_length - 8;
+    // the chain length is right in front of the time section
+    let chain_len_offset = section
+        .file_offset
+        .checked_add(section_length)
+        .and_then(|section_end| section_end.checked_sub(time_section_length))
+        .and_then(|offset| offset.checked_sub(8))
+        .filter(|&offset| offset >= vc_start)
+        .ok_or_else(|| invalid_data("the value-change data ends before it starts".into()))?;
+    // `read_signal_locs` subtracts without a check, so reject a corrupt chain length here.
+    input.seek(SeekFrom::Start(chain_len_offset))?;
+    let chain_len = read_u64(input)?;
+    if chain_len > chain_len_offset - vc_start {
+        return Err(invalid_data(format!(
+            "the chain length {chain_len} reaches before the value-change data"
+        )));
+    }
     let offsets = read_signal_locs(input, chain_len_offset, section.kind, max_handle, vc_start)?;
     input.seek(SeekFrom::Start(vc_start))?;
     let data = read_bytes(input, (chain_len_offset - vc_start) as usize)?;
 
     let mut locs = vec![None; max_handle as usize];
     for entry in offsets.iter() {
-        locs[entry.signal_idx] = Some((entry.offset, entry.len));
+        let loc = locs.get_mut(entry.signal_idx).ok_or_else(|| {
+            invalid_data(format!(
+                "signal index {} is not below the handle count {max_handle}",
+                entry.signal_idx
+            ))
+        })?;
+        *loc = Some((entry.offset, entry.len));
     }
     Ok(FstSection {
         info: FstSectionInfo {
@@ -276,13 +324,16 @@ pub(crate) fn read_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FstReader;
+    use crate::types::{BlockType, DataSectionKind};
+    use std::io::ErrorKind;
 
-    /// A section with one 2-state signal of `width` bits, one time point, and one uncompressed
-    /// change with the raw value bytes `value`.
-    fn section_with_one_change(width: u32, value: &[u8]) -> FstSection {
-        // chunk: varint 0 (= stored uncompressed), vli = (time delta 0 << 1) | 2-state, value
-        let mut chunk = vec![0x00, 0x00];
-        chunk.extend_from_slice(value);
+    /// A section with one signal of `width` bits (0 means variable length) and `time_points`
+    /// time table entries. The signal has one uncompressed chunk, which holds `change_bytes`.
+    fn section(width: u32, is_real: bool, time_points: usize, change_bytes: &[u8]) -> FstSection {
+        // chunk: varint 0 (= stored uncompressed), then the raw change bytes
+        let mut chunk = vec![0x00];
+        chunk.extend_from_slice(change_bytes);
         let mut data = vec![b'4']; // pack type byte at vc_start
         data.extend_from_slice(&chunk);
         FstSection {
@@ -290,25 +341,56 @@ mod tests {
                 start_time: 0,
                 end_time: 0,
             },
-            time_table: vec![0],
+            time_table: (0..time_points as u64).map(|t| t * 10).collect(),
             frame: vec![b'0'; width as usize],
             pack: ValueChangePackType::Lz4,
             data,
             locs: vec![Some((1, chunk.len() as u32))],
-            signals: vec![(width, false)],
+            signals: vec![(width, is_real)],
             float_endian: FloatingPointEndian::Little,
         }
     }
 
-    fn changes(section: &FstSection) -> Vec<(usize, u32, Vec<u8>)> {
+    /// A section with one 2-state signal of `width` bits, one time point, and one change at
+    /// time index 0 with the raw value bytes `value`.
+    fn section_with_one_change(width: u32, value: &[u8]) -> FstSection {
+        // vli = (time delta 0 << 1) | 2-state
+        let mut change_bytes = vec![0x00];
+        change_bytes.extend_from_slice(value);
+        section(width, false, 1, &change_bytes)
+    }
+
+    /// A value with owned bytes. A test can keep it after the callback returns.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Packed(u32, Vec<u8>),
+        Chars(Vec<u8>),
+        VarLen(Vec<u8>),
+        Real(f64),
+    }
+
+    /// All changes of handle 0 as `(time index, value)`.
+    fn changes(section: &FstSection) -> Vec<(usize, Seen)> {
         let mut seen = Vec::new();
         section
-            .for_each_change(FstSignalHandle::from_index(0), |ti, v| match v {
-                FstValue::Packed { width, bytes } => seen.push((ti, width, bytes.to_vec())),
-                other => panic!("unexpected value {other:?}"),
+            .for_each_change(FstSignalHandle::from_index(0), |ti, v| {
+                let owned = match v {
+                    FstValue::Packed { width, bytes } => Seen::Packed(width, bytes.to_vec()),
+                    FstValue::Chars(c) => Seen::Chars(c.to_vec()),
+                    FstValue::VarLen(c) => Seen::VarLen(c.to_vec()),
+                    FstValue::Real(r) => Seen::Real(r),
+                };
+                seen.push((ti, owned));
             })
             .unwrap();
         seen
+    }
+
+    fn assert_invalid_data(err: ReaderError) {
+        assert!(
+            matches!(&err, ReaderError::Io(e) if e.kind() == ErrorKind::InvalidData),
+            "expected an InvalidData error, got {err:?}"
+        );
     }
 
     #[test]
@@ -331,7 +413,7 @@ mod tests {
             let section = section_with_one_change(width, &raw);
             assert_eq!(
                 changes(&section),
-                vec![(0, width, expected)],
+                vec![(0, Seen::Packed(width, expected))],
                 "width {width}"
             );
         }
@@ -360,9 +442,233 @@ mod tests {
             .for_each_change(FstSignalHandle::from_index(0), |_, _| calls += 1)
             .unwrap_err();
         assert_eq!(calls, 0);
-        assert!(matches!(
-            err,
-            ReaderError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData
-        ));
+        assert_invalid_data(err);
+    }
+
+    #[test]
+    fn one_bit_2_state_values_are_packed() {
+        // 1-bit vli = (time delta << 2) | (value << 1), with bit 0 clear for 2-state.
+        // value 0 at time index 0, value 1 at time index 3.
+        let section = section(1, false, 4, &[0x00, (3 << 2) | (1 << 1)]);
+        assert_eq!(
+            changes(&section),
+            vec![
+                (0, Seen::Packed(1, vec![0x00])),
+                (3, Seen::Packed(1, vec![0x80])),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_bit_4_and_9_state_codes_are_chars() {
+        // 1-bit vli = (time delta << 4) | (code << 1) | 1. Codes 0 to 7 stand for `xzhuwl-?`.
+        // The first change is at time index 0. Each later change is one time index after the
+        // previous one.
+        let mut change_bytes = Vec::new();
+        for code in 0u8..8 {
+            let delta = u8::from(code != 0);
+            change_bytes.push((delta << 4) | (code << 1) | 1);
+        }
+        let section = section(1, false, 8, &change_bytes);
+        let expected: Vec<(usize, Seen)> = b"xzhuwl-?"
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (i, Seen::Chars(vec![c])))
+            .collect();
+        assert_eq!(changes(&section), expected);
+    }
+
+    #[test]
+    fn variable_length_values_are_byte_strings() {
+        // vli = time delta << 1, then a varint length, then the bytes.
+        let mut change_bytes = vec![0x00, 5];
+        change_bytes.extend_from_slice(b"hello");
+        // an empty string two time indices later
+        change_bytes.extend_from_slice(&[2 << 1, 0]);
+        let section = section(0, false, 3, &change_bytes);
+        assert_eq!(
+            changes(&section),
+            vec![
+                (0, Seen::VarLen(b"hello".to_vec())),
+                (2, Seen::VarLen(Vec::new())),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_bit_values_with_chars_are_chars() {
+        // vli = (time delta << 1) | 1, then one character per bit.
+        let mut change_bytes = vec![(2 << 1) | 1];
+        change_bytes.extend_from_slice(b"x01z");
+        let section = section(4, false, 3, &change_bytes);
+        assert_eq!(changes(&section), vec![(2, Seen::Chars(b"x01z".to_vec()))]);
+    }
+
+    #[test]
+    fn real_values_stored_as_f64_bytes_are_decoded() {
+        for endian in [FloatingPointEndian::Little, FloatingPointEndian::Big] {
+            // vli = (time delta << 1) | 1, then the 8 raw bytes of the f64.
+            let mut change_bytes = vec![(1 << 1) | 1];
+            match endian {
+                FloatingPointEndian::Little => {
+                    change_bytes.extend_from_slice(&1.5f64.to_le_bytes())
+                }
+                FloatingPointEndian::Big => change_bytes.extend_from_slice(&1.5f64.to_be_bytes()),
+            }
+            let mut section = section(8, true, 2, &change_bytes);
+            section.float_endian = endian;
+            assert_eq!(changes(&section), vec![(1, Seen::Real(1.5))]);
+        }
+    }
+
+    #[test]
+    fn real_values_stored_as_packed_bits_mirror_upstream() {
+        // vli = time delta << 1, then ceil(8 / 8) = 1 packed byte. Upstream `read_signals`
+        // expands the packed byte to 8 ASCII characters (`0` or `1`) and reads an f64 from
+        // those characters. This is a quirk, not a meaningful value. The section API must give
+        // the same f64 as `read_signals`, so this test computes the expectation the same way.
+        let raw = 0b1011_0010u8;
+        let chars: [u8; 8] = std::array::from_fn(|i| b'0' + ((raw >> (7 - i)) & 1));
+        assert_eq!(&chars, b"10110010");
+        for endian in [FloatingPointEndian::Little, FloatingPointEndian::Big] {
+            let expected = match endian {
+                FloatingPointEndian::Little => f64::from_le_bytes(chars),
+                FloatingPointEndian::Big => f64::from_be_bytes(chars),
+            };
+            assert!(expected.is_finite());
+            let mut section = section(8, true, 3, &[2 << 1, raw]);
+            section.float_endian = endian;
+            assert_eq!(changes(&section), vec![(2, Seen::Real(expected))]);
+        }
+    }
+
+    #[test]
+    fn a_handle_without_signal_info_is_an_error() {
+        // `locs` has two handles, but `signals` has only one. This cannot come from
+        // `read_section`, which checks it, but a corrupt file must never cause a panic.
+        let mut section = section_with_one_change(4, &[0b1010_0000]);
+        section.locs.push(section.locs[0]);
+        assert_eq!(section.max_handle(), 2);
+        assert_eq!(changes(&section).len(), 1, "handle 0 is fine");
+        let mut calls = 0;
+        let err = section
+            .for_each_change(FstSignalHandle::from_index(1), |_, _| calls += 1)
+            .unwrap_err();
+        assert_eq!(calls, 0);
+        assert_invalid_data(err);
+    }
+
+    /// The bytes of a small valid FST file with one value-change section and one 4-bit signal.
+    fn small_fst_file() -> Vec<u8> {
+        use fst_writer::{
+            FstFileType, FstInfo, FstScopeType, FstSignalType, FstVarDirection, FstVarType,
+            open_fst,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.fst");
+        let info = FstInfo {
+            start_time: 0,
+            timescale_exponent: -12,
+            version: "section unit test".into(),
+            date: "2026-10-08".into(),
+            file_type: FstFileType::Verilog,
+        };
+        let mut header = open_fst(&path, &info).unwrap();
+        header.scope("top", "top", FstScopeType::Module).unwrap();
+        let id = header
+            .var(
+                "s",
+                FstSignalType::bit_vec(4),
+                FstVarType::Wire,
+                FstVarDirection::Implicit,
+                None,
+            )
+            .unwrap();
+        header.up_scope().unwrap();
+        let mut body = header.finish().unwrap();
+        body.signal_change(id, b"0000").unwrap();
+        for (time, value) in [(10, b"0001"), (20, b"0011"), (30, b"0111")] {
+            body.time_change(time).unwrap();
+            body.signal_change(id, value).unwrap();
+        }
+        body.finish().unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    /// Finds the first value-change section in the bytes of an FST file. Returns its info and
+    /// the file offset of its chain length field.
+    ///
+    /// The tests below patch bytes of a real file. This is simpler than crafting a file by hand.
+    fn locate_data_section(bytes: &[u8]) -> (DataSectionInfo, u64) {
+        let be_u64 = |pos: u64| {
+            let pos = pos as usize;
+            u64::from_be_bytes(bytes[pos..pos + 8].try_into().unwrap())
+        };
+        let mut block_start = 0u64;
+        while (block_start as usize) < bytes.len() {
+            let block_type = BlockType::try_from(bytes[block_start as usize]).unwrap();
+            // `file_offset` points to the section length, after the block type byte.
+            let file_offset = block_start + 1;
+            let section_length = be_u64(file_offset);
+            if let Some(kind) = DataSectionKind::from_block_type(&block_type) {
+                let section_end = file_offset + section_length;
+                // The last 24 bytes of the section describe the time table.
+                let time_compressed = be_u64(section_end - 16);
+                let time_section_length = time_compressed + 24;
+                let info = DataSectionInfo {
+                    file_offset,
+                    start_time: be_u64(file_offset + 8),
+                    end_time: be_u64(file_offset + 16),
+                    kind,
+                    mem_required_for_traversal: be_u64(file_offset + 24),
+                };
+                return (info, section_end - time_section_length - 8);
+            }
+            block_start = file_offset + section_length;
+        }
+        panic!("no value-change section in the file");
+    }
+
+    #[test]
+    fn a_chain_length_before_the_value_change_data_is_an_error() {
+        let bytes = small_fst_file();
+        let (_, chain_len_offset) = locate_data_section(&bytes);
+        let at = chain_len_offset as usize;
+        FstReader::open(std::io::Cursor::new(bytes.clone()))
+            .unwrap()
+            .read_section(0)
+            .map(|_| ())
+            .expect("the unchanged file is valid");
+
+        // The chain starts `chain length` bytes before the chain length field. Each value puts
+        // the start of the chain before the start of the value-change data.
+        for chain_length in [chain_len_offset - 1, chain_len_offset, u64::MAX] {
+            let mut corrupt = bytes.clone();
+            corrupt[at..at + 8].copy_from_slice(&chain_length.to_be_bytes());
+            let mut reader = FstReader::open(std::io::Cursor::new(corrupt)).unwrap();
+            let err = reader
+                .read_section(0)
+                .err()
+                .unwrap_or_else(|| panic!("chain length {chain_length} must be an error"));
+            assert_invalid_data(err);
+        }
+    }
+
+    #[test]
+    fn more_handles_than_signals_is_an_error() {
+        // `read_section` is called with the internal section info and no signal info, so the
+        // section has one handle (`max_handle`) but 0 signals.
+        let bytes = small_fst_file();
+        let (info, _) = locate_data_section(&bytes);
+        let mut input = std::io::Cursor::new(bytes);
+        let read = |input: &mut std::io::Cursor<Vec<u8>>, signals: &[SignalInfo]| {
+            read_section(input, &info, signals, FloatingPointEndian::Little)
+        };
+        let one_signal = [SignalInfo::from_file_format(4)];
+        read(&mut input, &one_signal)
+            .map(|_| ())
+            .expect("one handle, one signal");
+        let err = read(&mut input, &[]).err().expect("one handle, no signal");
+        assert_invalid_data(err);
     }
 }
