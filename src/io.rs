@@ -74,6 +74,14 @@ pub enum ReaderError {
 
 pub type ReadResult<T> = Result<T, ReaderError>;
 
+/// An error for data that is present, but not valid.
+pub(crate) fn invalid_data(message: String) -> ReaderError {
+    ReaderError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
+}
+
 #[derive(Debug, Error)]
 pub enum ReadSignalsError<E = ()> {
     #[error("Failed to read FST file.")]
@@ -1378,13 +1386,32 @@ pub(crate) fn skip_frame(input: &mut (impl Read + Seek), section_start: u64) -> 
 #[derive(Debug)]
 pub(crate) struct OffsetTable(Vec<SignalDataLoc>);
 
-impl From<Vec<SignalDataLoc>> for OffsetTable {
-    fn from(value: Vec<SignalDataLoc>) -> Self {
-        Self(value)
-    }
-}
-
 impl OffsetTable {
+    /// Checks that every alias points to a signal that has an offset. A corrupt chain can break
+    /// this. [`OffsetTable::iter`] relies on it.
+    fn new(locs: Vec<SignalDataLoc>) -> ReadResult<Self> {
+        for (idx, loc) in locs.iter().enumerate() {
+            if let SignalDataLoc::Alias(target) = loc {
+                match locs.get(*target as usize) {
+                    Some(SignalDataLoc::Offset(_, _)) => {}
+                    Some(_) => {
+                        return Err(invalid_data(format!(
+                            "signal {idx} is an alias of signal {target}, which has no offset"
+                        )));
+                    }
+                    None => {
+                        return Err(invalid_data(format!(
+                            "signal {idx} is an alias of signal {target}, which is outside \
+                             the {} signals of the chain",
+                            locs.len()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(Self(locs))
+    }
+
     pub(crate) fn iter(&self) -> OffsetTableIter<'_> {
         OffsetTableIter {
             table: self,
@@ -1401,7 +1428,7 @@ impl OffsetTable {
         match &self.0[signal_idx] {
             SignalDataLoc::None => None,
             // aliases should always directly point to an offset,
-            // so we should not have to recurse!
+            // so we should not have to recurse! `OffsetTable::new` checks this.
             SignalDataLoc::Alias(alias_idx) => match &self.0[*alias_idx as usize] {
                 SignalDataLoc::Offset(offset, len) => Some(OffsetEntry {
                     signal_idx,
@@ -1517,7 +1544,7 @@ fn read_value_change_alias2(
 
     debug_assert_eq!(max_handle as usize, idx);
 
-    Ok(table.into())
+    OffsetTable::new(table)
 }
 
 fn read_value_change_alias(
@@ -1564,7 +1591,7 @@ fn read_value_change_alias(
         table[prev_offset_idx] = SignalDataLoc::Offset(prev_offset, len);
     }
 
-    Ok(table.into())
+    OffsetTable::new(table)
 }
 
 /// Indicates the location of the signal data for the current block.
@@ -1948,5 +1975,106 @@ mod tests {
         fn test_prop_read_write_time_table(table: Vec<u64>, compressed: bool) {
             read_write_time_table(table, compressed);
         }
+    }
+
+    fn assert_invalid_data<T: std::fmt::Debug>(result: ReadResult<T>) {
+        match result {
+            Err(ReaderError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {}
+            other => panic!("expected an InvalidData error, got {other:?}"),
+        }
+    }
+
+    /// The chain of a standard section (kind 1 and 2 in `read_value_change_alias`). A raw value
+    /// of 0 is followed by `alias + 1`, an odd raw value is `(offset delta << 1) | 1`, and an
+    /// even raw value is `zero count << 1`.
+    #[test]
+    fn a_standard_chain_with_an_alias_outside_the_table_is_an_error() {
+        // The only signal is an alias of signal 1, but the table has one entry.
+        assert_invalid_data(read_value_change_alias(&[0x00, 0x02], 1, 10));
+    }
+
+    #[test]
+    fn a_standard_chain_with_an_alias_of_a_signal_without_data_is_an_error() {
+        // Signal 0 has no data. Signal 1 is an alias of signal 0.
+        assert_invalid_data(read_value_change_alias(&[0x02, 0x00, 0x01], 2, 10));
+    }
+
+    #[test]
+    fn a_standard_chain_with_an_alias_of_an_alias_is_an_error() {
+        // Signal 0 has data, signal 1 is an alias of signal 0, and signal 2 is an alias of
+        // signal 1.
+        assert_invalid_data(read_value_change_alias(
+            &[0x03, 0x00, 0x01, 0x00, 0x02],
+            3,
+            10,
+        ));
+    }
+
+    #[test]
+    fn a_standard_chain_with_a_valid_alias_gives_the_offset_of_its_target() {
+        let table = read_value_change_alias(&[0x03, 0x00, 0x01], 2, 10).unwrap();
+        let entries: Vec<_> = table
+            .iter()
+            .map(|e| (e.signal_idx, e.offset, e.len))
+            .collect();
+        assert_eq!(entries, vec![(0, 1, 9), (1, 1, 9)]);
+    }
+
+    /// The chain of a dynamic alias 2 section. An odd first byte starts a signed value. A
+    /// positive value is an offset delta, a negative value `-(target + 1)` is an alias, and 0
+    /// repeats the previous alias. An even first byte is `zero count << 1`.
+    fn alias2_chain(values: &[i64]) -> Vec<u8> {
+        let mut chain = Vec::new();
+        for value in values {
+            write_variant_i64(&mut chain, (value << 1) | 1).unwrap();
+        }
+        chain
+    }
+
+    #[test]
+    fn an_alias2_chain_with_an_alias_outside_the_table_is_an_error() {
+        // The only signal is an alias of signal 5.
+        assert_invalid_data(read_value_change_alias2(&alias2_chain(&[-6]), 1, 10));
+    }
+
+    #[test]
+    fn an_alias2_chain_with_an_alias_of_a_signal_without_data_is_an_error() {
+        // One signal without data (zero count 1, so the byte 2), then an alias of signal 0.
+        let mut chain = vec![0x02];
+        chain.extend(alias2_chain(&[-1]));
+        assert_invalid_data(read_value_change_alias2(&chain, 2, 10));
+    }
+
+    #[test]
+    fn an_alias2_chain_with_an_alias_of_an_alias_is_an_error() {
+        // Signal 0 has data and signal 1 is an alias of signal 0. Signal 2 is an alias of
+        // signal 1, which is an alias itself.
+        assert_invalid_data(read_value_change_alias2(&alias2_chain(&[1, -1, -2]), 3, 10));
+    }
+
+    #[test]
+    fn an_alias2_chain_with_valid_aliases_gives_the_offset_of_their_target() {
+        // Signal 0 has data. Signals 1 and 2 are aliases of signal 0 (the second repeats it).
+        let table = read_value_change_alias2(&alias2_chain(&[1, -1, 0]), 3, 10).unwrap();
+        let entries: Vec<_> = table
+            .iter()
+            .map(|e| (e.signal_idx, e.offset, e.len))
+            .collect();
+        assert_eq!(entries, vec![(0, 1, 9), (1, 1, 9), (2, 1, 9)]);
+    }
+
+    #[test]
+    fn read_signal_locs_rejects_an_alias_outside_the_table() {
+        // The chain, then its length as a big-endian u64, as in a section.
+        let mut bytes = vec![0x00, 0x02];
+        bytes.extend_from_slice(&2u64.to_be_bytes());
+        let result = read_signal_locs(
+            &mut std::io::Cursor::new(bytes),
+            2,
+            DataSectionKind::Standard,
+            1,
+            0,
+        );
+        assert_invalid_data(result);
     }
 }

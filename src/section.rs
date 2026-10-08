@@ -10,8 +10,8 @@
 
 use crate::FstSignalHandle;
 use crate::io::{
-    RCV_STR, ReadResult, ReaderError, multi_bit_digital_signal_to_chars, read_bytes, read_f64,
-    read_packed_signal_value_bytes, read_signal_locs, read_time_table, read_u8, read_u64,
+    RCV_STR, ReadResult, ReaderError, invalid_data, multi_bit_digital_signal_to_chars, read_bytes,
+    read_f64, read_packed_signal_value_bytes, read_signal_locs, read_time_table, read_u8, read_u64,
     read_variant_u32, read_variant_u64, read_zlib_compressed_bytes,
 };
 use crate::types::{DataSectionInfo, FloatingPointEndian, SignalInfo, ValueChangePackType};
@@ -71,13 +71,6 @@ fn unexpected_eof() -> ReaderError {
     ReaderError::Io(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
         "unexpected eof",
-    ))
-}
-
-fn invalid_data(message: String) -> ReaderError {
-    ReaderError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message,
     ))
 }
 
@@ -654,6 +647,48 @@ mod tests {
                 .unwrap_or_else(|| panic!("chain length {chain_length} must be an error"));
             assert_invalid_data(err);
         }
+    }
+
+    /// Replaces the only byte of the chain of `small_fst_file` and reads the section.
+    fn read_section_with_chain_byte(chain_byte: u8) -> ReadResult<FstSection> {
+        let mut bytes = small_fst_file();
+        let (_, chain_len_offset) = locate_data_section(&bytes);
+        let at = chain_len_offset as usize;
+        let chain_len = u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap());
+        // One signal with data: its offset delta is one byte.
+        assert_eq!(chain_len, 1);
+        bytes[at - 1] = chain_byte;
+        FstReader::open(std::io::Cursor::new(bytes))
+            .unwrap()
+            .read_section(0)
+    }
+
+    #[test]
+    fn a_chain_alias_outside_the_signals_is_an_error() {
+        // The byte 0x7d is the alias of signal 1, but there is only signal 0.
+        assert_invalid_data(
+            read_section_with_chain_byte(0x7d)
+                .err()
+                .expect("the alias target is outside the table"),
+        );
+    }
+
+    #[test]
+    fn a_chain_alias_of_a_signal_without_an_offset_is_an_error() {
+        // The byte 0x7f is the alias of signal 0, which is this alias itself.
+        assert_invalid_data(
+            read_section_with_chain_byte(0x7f)
+                .err()
+                .expect("the alias target has no offset"),
+        );
+    }
+
+    #[test]
+    fn the_original_chain_byte_is_valid() {
+        // 0x03 is an offset delta of 1, which the writer produces.
+        read_section_with_chain_byte(0x03)
+            .map(|_| ())
+            .expect("the unchanged file is valid");
     }
 
     #[test]
