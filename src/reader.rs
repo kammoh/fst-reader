@@ -282,8 +282,11 @@ impl<R: BufRead + Seek> FstReader<R> {
 
     /// Reads one value-change section into memory. See [`crate::FstSection`].
     ///
-    /// Returns an error for a bad handle count, section layout, or chain length. The shared
-    /// helpers that read the time table and the chain can still panic on other kinds of damage.
+    /// Returns an error for a bad handle count, section layout, chain length, or chain alias.
+    /// The frame stays compressed, so a damaged frame is an error only in
+    /// [`crate::FstSection::for_each_frame_value`]. The helpers that read the time table and the
+    /// chain can still panic on other kinds of damage. Examples are a time table that is larger
+    /// than its section, and a chain with an offset delta of zero.
     pub fn read_section(&mut self, index: usize) -> Result<crate::FstSection> {
         let section = self.meta.data_sections.get(index).cloned().ok_or_else(|| {
             ReaderError::Io(std::io::Error::new(

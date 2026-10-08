@@ -343,6 +343,17 @@ pub(crate) fn read_multi_bit_signal_time_delta(bytes: &[u8], offset: u32) -> Rea
     Ok((vli >> 1) as usize)
 }
 
+/// Returns an error if the decompressed data does not have the length that the file declares.
+fn check_uncompressed_length(actual: usize, declared: u64) -> ReadResult<()> {
+    if actual as u64 == declared {
+        Ok(())
+    } else {
+        Err(invalid_data(format!(
+            "expected {declared} bytes after decompression, got {actual}"
+        )))
+    }
+}
+
 /// Reads ZLib compressed bytes.
 pub(crate) fn read_zlib_compressed_bytes(
     input: &mut (impl Read + Seek),
@@ -353,15 +364,7 @@ pub(crate) fn read_zlib_compressed_bytes(
     let bytes = if uncompressed_length == compressed_length && allow_uncompressed {
         read_bytes(input, compressed_length as usize)?
     } else {
-        let start = input.stream_position()?;
-
-        // read first byte to check which compression is used.
-        let first_byte = read_u8(input)?;
-        input.seek(SeekFrom::Start(start))?;
-        // for zlib compression, the first byte should be 0x78
-        let is_zlib = first_byte == 0x78;
-        debug_assert!(is_zlib, "expected a zlib compressed block!");
-
+        // The decoder checks the zlib header, so we do not have to.
         let compressed = read_bytes(input, compressed_length as usize)?;
 
         miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
@@ -369,7 +372,7 @@ pub(crate) fn read_zlib_compressed_bytes(
             uncompressed_length as usize,
         )?
     };
-    assert_eq!(bytes.len(), uncompressed_length as usize);
+    check_uncompressed_length(bytes.len(), uncompressed_length)?;
     Ok(bytes)
 }
 
@@ -633,7 +636,7 @@ fn read_gzip_compressed_bytes(
     let data = read_bytes(input, compressed_len - 10)?;
     let uncompressed =
         miniz_oxide::inflate::decompress_to_vec_with_limit(data.as_slice(), uncompressed_len)?;
-    debug_assert_eq!(uncompressed.len(), uncompressed_len);
+    check_uncompressed_length(uncompressed.len(), uncompressed_len as u64)?;
     Ok(uncompressed)
 }
 
@@ -693,7 +696,7 @@ pub(crate) fn read_hierarchy_bytes(
                     read_lz4_compressed_bytes(&mut lvl1_reader, uncompressed_length, lvl1_len)?
                 }
             };
-            assert_eq!(bytes.len(), uncompressed_length);
+            check_uncompressed_length(bytes.len(), uncompressed_length as u64)?;
             bytes
         }
     })
@@ -1212,11 +1215,17 @@ pub(crate) fn read_packed_signal_value_bytes(
     tpe: ValueChangePackType,
 ) -> ReadResult<Vec<u8>> {
     let (value, skiplen) = read_variant_u32(input)?;
+    // The chunk length includes the length prefix that we just read.
+    let data_length = len.checked_sub(skiplen).ok_or_else(|| {
+        invalid_data(format!(
+            "the chunk of {len} bytes is shorter than its length prefix of {skiplen} bytes"
+        ))
+    })?;
     if value != 0 {
         let uncompressed_length = value as u64;
         let uncompressed: Vec<u8> = match tpe {
             ValueChangePackType::Lz4 => {
-                let compressed_length = (len - skiplen) as u64;
+                let compressed_length = data_length as u64;
                 read_lz4_compressed_bytes(
                     input,
                     uncompressed_length as usize,
@@ -1224,7 +1233,7 @@ pub(crate) fn read_packed_signal_value_bytes(
                 )?
             }
             ValueChangePackType::FastLz => {
-                let compressed_length = (len - skiplen) as u64;
+                let compressed_length = data_length as u64;
                 crate::fastlz::decompress(
                     input,
                     compressed_length as usize,
@@ -1240,8 +1249,7 @@ pub(crate) fn read_packed_signal_value_bytes(
         };
         Ok(uncompressed)
     } else {
-        let dest_length = len - skiplen;
-        let bytes = read_bytes(input, dest_length as usize)?;
+        let bytes = read_bytes(input, data_length as usize)?;
         Ok(bytes)
     }
 }
@@ -2075,6 +2083,97 @@ mod tests {
             1,
             0,
         );
+        assert_invalid_data(result);
+    }
+
+    /// A valid zlib stream of `bytes` and its length.
+    fn zlib(bytes: &[u8]) -> (Vec<u8>, u64) {
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(bytes, 3);
+        let len = compressed.len() as u64;
+        (compressed, len)
+    }
+
+    #[test]
+    fn zlib_bytes_with_the_declared_length_are_returned() {
+        let bytes = vec![7u8; 100];
+        let (compressed, compressed_len) = zlib(&bytes);
+        for allow_uncompressed in [false, true] {
+            let mut input = std::io::Cursor::new(compressed.clone());
+            let actual = read_zlib_compressed_bytes(
+                &mut input,
+                bytes.len() as u64,
+                compressed_len,
+                allow_uncompressed,
+            )
+            .unwrap();
+            assert_eq!(actual, bytes);
+        }
+    }
+
+    #[test]
+    fn zlib_bytes_with_a_longer_declared_length_are_an_error() {
+        // The stream expands to 100 bytes, but the declared length is 101.
+        let (compressed, compressed_len) = zlib(&[7u8; 100]);
+        for allow_uncompressed in [false, true] {
+            let mut input = std::io::Cursor::new(compressed.clone());
+            let result =
+                read_zlib_compressed_bytes(&mut input, 101, compressed_len, allow_uncompressed);
+            assert_invalid_data(result);
+        }
+    }
+
+    #[test]
+    fn zlib_bytes_with_a_shorter_declared_length_are_an_error() {
+        let (compressed, compressed_len) = zlib(&[7u8; 100]);
+        let mut input = std::io::Cursor::new(compressed);
+        assert!(read_zlib_compressed_bytes(&mut input, 99, compressed_len, false).is_err());
+    }
+
+    #[test]
+    fn a_stream_that_is_not_zlib_is_an_error() {
+        let mut input = std::io::Cursor::new(b"not a zlib stream".to_vec());
+        assert!(read_zlib_compressed_bytes(&mut input, 100, 17, false).is_err());
+    }
+
+    #[test]
+    fn stored_bytes_that_are_cut_short_are_an_error() {
+        // The lengths are equal, so the bytes are not compressed. The input has only 5 of 10.
+        let mut input = std::io::Cursor::new(vec![1u8; 5]);
+        assert_invalid_data(read_zlib_compressed_bytes(&mut input, 10, 10, true));
+    }
+
+    #[test]
+    fn a_hierarchy_with_a_wrong_declared_length_is_an_error() {
+        let bytes = vec![3u8; 100];
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_hierarchy_bytes(&mut buf, HierarchyCompression::ZLib, &bytes).unwrap();
+        let mut file = buf.into_inner();
+        // The block starts with the section length and the uncompressed length.
+        let declared = u64::from_be_bytes(file[8..16].try_into().unwrap());
+        assert_eq!(declared, 100);
+        file[8..16].copy_from_slice(&101u64.to_be_bytes());
+        let result =
+            read_hierarchy_bytes(&mut std::io::Cursor::new(file), HierarchyCompression::ZLib);
+        assert_invalid_data(result);
+    }
+
+    #[test]
+    fn a_chunk_shorter_than_its_length_prefix_is_an_error() {
+        // The chunk starts with the varint 300 (2 bytes), but the chunk length is 1.
+        for tpe in [
+            ValueChangePackType::Lz4,
+            ValueChangePackType::FastLz,
+            ValueChangePackType::Zlib,
+        ] {
+            let mut input = std::io::Cursor::new(vec![0xac, 0x02, 0x00]);
+            let result = read_packed_signal_value_bytes(&mut input, 1, tpe);
+            // Zlib does not subtract the prefix length, so it fails in the decoder.
+            assert!(result.is_err(), "{tpe:?}");
+        }
+        // The uncompressed length 0 (1 byte) means that the chunk is stored. The chunk length 0
+        // is shorter than the prefix.
+        let mut input = std::io::Cursor::new(vec![0x00]);
+        let result = read_packed_signal_value_bytes(&mut input, 0, ValueChangePackType::Lz4);
         assert_invalid_data(result);
     }
 }

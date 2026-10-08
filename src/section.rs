@@ -45,11 +45,15 @@ const PACKED_ZERO: [u8; 1] = [0x00];
 const PACKED_ONE: [u8; 1] = [0x80];
 
 /// One value-change section, read into memory. The value-change data stays compressed until
-/// [`FstSection::for_each_change`] decodes one signal.
+/// [`FstSection::for_each_change`] decodes one signal. The frame stays compressed until
+/// [`FstSection::for_each_frame_value`] reads it.
 pub struct FstSection {
     info: FstSectionInfo,
     time_table: Vec<u64>,
+    /// The frame as stored in the file, usually zlib compressed.
     frame: Vec<u8>,
+    /// The length of the frame after decompression, as declared in the file.
+    frame_uncompressed_len: u64,
     pack: ValueChangePackType,
     /// Value-change data from the pack-type byte (`vc_start`) to the chain length field.
     data: Vec<u8>,
@@ -107,11 +111,20 @@ impl FstSection {
 
     /// Calls `f` with the value of every signal at the start of the section.
     /// Variable-length signals have no frame value and are skipped.
+    ///
+    /// This method decompresses the frame. It returns an error if the frame is damaged. The
+    /// other methods do not need the frame, so they do not fail because of a damaged frame.
     pub fn for_each_frame_value(
         &self,
         mut f: impl FnMut(FstSignalHandle, FstValue<'_>),
     ) -> ReadResult<()> {
-        let mut rest: &[u8] = &self.frame;
+        let frame = read_zlib_compressed_bytes(
+            &mut Cursor::new(self.frame.as_slice()),
+            self.frame_uncompressed_len,
+            self.frame.len() as u64,
+            true,
+        )?;
+        let mut rest: &[u8] = &frame;
         for (idx, &(width, is_real)) in self.signals.iter().enumerate() {
             let handle = FstSignalHandle::from_index(idx);
             if width == 0 {
@@ -136,10 +149,9 @@ impl FstSection {
     /// the file header. [`crate::FstReader::read_signals`] drops those changes. A caller that
     /// needs the same result as `read_signals` must apply the same cut.
     ///
-    /// Returns an error if the decoded bytes are inconsistent. For example, a time index may be
-    /// outside [`FstSection::time_table`], a value may be cut short, or a handle may have no
-    /// signal information. The decompression helpers shared with `read_signals` can still panic
-    /// on a damaged compressed block.
+    /// Returns an error if the stored bytes are inconsistent or damaged. For example, a time
+    /// index may be outside [`FstSection::time_table`], a value may be cut short, a handle may
+    /// have no signal information, or the compressed data may be corrupt.
     pub fn for_each_change(
         &self,
         handle: FstSignalHandle,
@@ -257,7 +269,14 @@ pub(crate) fn read_section(
     let (frame_uncompressed, _) = read_variant_u64(input)?;
     let (frame_compressed, _) = read_variant_u64(input)?;
     let (_frame_max_handle, _) = read_variant_u64(input)?;
-    let frame = read_zlib_compressed_bytes(input, frame_uncompressed, frame_compressed, true)?;
+    // `read_signals` reads the frame of the first section only, and the caller of this function
+    // may not need it at all. Keep the stored bytes and decompress them on demand.
+    if frame_compressed > section_length {
+        return Err(invalid_data(format!(
+            "the frame has {frame_compressed} bytes, but the section has {section_length}"
+        )));
+    }
+    let frame = read_bytes(input, frame_compressed as usize)?;
 
     // value-change data follows the frame
     let (max_handle, _) = read_variant_u64(input)?;
@@ -308,6 +327,7 @@ pub(crate) fn read_section(
         },
         time_table,
         frame,
+        frame_uncompressed_len: frame_uncompressed,
         pack,
         data,
         locs,
@@ -320,6 +340,7 @@ pub(crate) fn read_section(
 mod tests {
     use super::*;
     use crate::FstReader;
+    use crate::io::read_variant_u64;
     use crate::types::{BlockType, DataSectionKind};
     use std::io::ErrorKind;
 
@@ -338,6 +359,7 @@ mod tests {
             },
             time_table: (0..time_points as u64).map(|t| t * 10).collect(),
             frame: vec![b'0'; width as usize],
+            frame_uncompressed_len: width as u64,
             pack: ValueChangePackType::Lz4,
             data,
             locs: vec![Some((1, chunk.len() as u32))],
@@ -689,6 +711,110 @@ mod tests {
         read_section_with_chain_byte(0x03)
             .map(|_| ())
             .expect("the unchanged file is valid");
+    }
+
+    /// The file with another frame in the first value-change section. `stored` is written as
+    /// the frame bytes. `uncompressed` and `compressed` are the lengths declared in front of
+    /// them. The section length is adjusted. The rest of the file stays the same.
+    fn replace_frame(bytes: &[u8], stored: &[u8], uncompressed: u64, compressed: u64) -> Vec<u8> {
+        let (info, _) = locate_data_section(bytes);
+        let section_start = info.file_offset as usize;
+        // the section header has 4 u64 fields; the frame follows
+        let frame_start = section_start + 4 * 8;
+        let mut cursor = &bytes[frame_start..];
+        let (_, _) = read_variant_u64(&mut cursor).unwrap();
+        let (old_compressed, _) = read_variant_u64(&mut cursor).unwrap();
+        let (max_handle, _) = read_variant_u64(&mut cursor).unwrap();
+        let old_frame_end = bytes.len() - cursor.len() + old_compressed as usize;
+
+        let mut frame = Vec::new();
+        for value in [uncompressed, compressed, max_handle] {
+            crate::io::write_variant_u64(&mut frame, value).unwrap();
+        }
+        frame.extend_from_slice(stored);
+
+        let old_section_length =
+            u64::from_be_bytes(bytes[section_start..section_start + 8].try_into().unwrap());
+        let section_length =
+            old_section_length + frame.len() as u64 - (old_frame_end - frame_start) as u64;
+        let mut out = bytes[..section_start].to_vec();
+        out.extend_from_slice(&section_length.to_be_bytes());
+        out.extend_from_slice(&bytes[section_start + 8..frame_start]);
+        out.extend_from_slice(&frame);
+        out.extend_from_slice(&bytes[old_frame_end..]);
+        out
+    }
+
+    /// The frame values as (handle index, characters).
+    fn frame_values(section: &FstSection) -> ReadResult<Vec<(usize, Vec<u8>)>> {
+        let mut seen = Vec::new();
+        section.for_each_frame_value(|h, v| match v {
+            FstValue::Chars(c) => seen.push((h.get_index(), c.to_vec())),
+            other => panic!("expected chars, got {other:?}"),
+        })?;
+        Ok(seen)
+    }
+
+    fn open_section(bytes: Vec<u8>) -> ReadResult<FstSection> {
+        FstReader::open(std::io::Cursor::new(bytes))
+            .unwrap()
+            .read_section(0)
+    }
+
+    #[test]
+    fn a_zlib_frame_is_decompressed_when_the_frame_values_are_read() {
+        let original = small_fst_file();
+        let expected_changes = changes(&open_section(original.clone()).unwrap());
+        let stored = miniz_oxide::deflate::compress_to_vec_zlib(b"0000", 3);
+        assert_ne!(stored.len(), 4, "equal lengths would mean stored bytes");
+        let file = replace_frame(&original, &stored, 4, stored.len() as u64);
+        let section = open_section(file).unwrap();
+        assert_eq!(frame_values(&section).unwrap(), vec![(0, b"0000".to_vec())]);
+        assert_eq!(changes(&section), expected_changes);
+    }
+
+    #[test]
+    fn a_stored_frame_is_returned_as_it_is() {
+        let original = small_fst_file();
+        let section = open_section(replace_frame(&original, b"01xz", 4, 4)).unwrap();
+        assert_eq!(frame_values(&section).unwrap(), vec![(0, b"01xz".to_vec())]);
+    }
+
+    #[test]
+    fn a_frame_with_a_wrong_declared_length_is_an_error_only_when_it_is_read() {
+        let original = small_fst_file();
+        let expected_changes = changes(&open_section(original.clone()).unwrap());
+        // A valid zlib stream of 4 bytes, but the declared length is 5.
+        let stored = miniz_oxide::deflate::compress_to_vec_zlib(b"0000", 3);
+        let file = replace_frame(&original, &stored, 5, stored.len() as u64);
+        let section = open_section(file).expect("the frame is not needed to read the section");
+        assert_invalid_data(frame_values(&section).unwrap_err());
+        // The value changes do not depend on the frame.
+        assert_eq!(changes(&section), expected_changes);
+    }
+
+    #[test]
+    fn a_corrupt_frame_is_an_error_only_when_it_is_read() {
+        let original = small_fst_file();
+        let expected_changes = changes(&open_section(original.clone()).unwrap());
+        // The lengths differ, so the bytes must be a zlib stream, but they are not.
+        let file = replace_frame(&original, b"not zlib", 4, 8);
+        let section = open_section(file).expect("the frame is not needed to read the section");
+        assert!(frame_values(&section).is_err());
+        assert_eq!(changes(&section), expected_changes);
+
+        // A zlib header followed by damaged data.
+        let file = replace_frame(&original, &[0x78, 0x9c, 0xff, 0xff, 0xff, 0xff], 4, 6);
+        let section = open_section(file).expect("the frame is not needed to read the section");
+        assert!(frame_values(&section).is_err());
+        assert_eq!(changes(&section), expected_changes);
+    }
+
+    #[test]
+    fn a_frame_longer_than_its_section_is_an_error() {
+        let original = small_fst_file();
+        let file = replace_frame(&original, b"0000", 4, u64::MAX / 2);
+        assert_invalid_data(open_section(file).err().expect("the frame is too long"));
     }
 
     #[test]
