@@ -618,6 +618,11 @@ impl<R: Read + Seek> HeaderReader<R> {
                     // (length alone is not sufficient - Real signals have length=64 but should be SignalInfo::Real)
                     let signal_info = if tpe.is_real() {
                         SignalInfo::Real
+                    } else if length == 0 {
+                        // A variable without a width, for example a string, is a variable-length
+                        // signal. The geometry block stores this as `u32::MAX`. The value 0
+                        // stands for a real signal there.
+                        SignalInfo::from_file_format(u32::MAX)
                     } else {
                         SignalInfo::from_file_format(length)
                     };
