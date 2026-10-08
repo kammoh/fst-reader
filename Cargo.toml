@@ -21,6 +21,8 @@ fst-sys = "0.2.0"
 leb128 = "0.2.5"
 proptest = "1.11"
 proptest-derive = "0.8"
+fst-writer = "0.3.1"
+tempfile = "3"
 
 [profile.release]
 debug = true
