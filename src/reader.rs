@@ -100,7 +100,7 @@ impl<R: BufRead + Seek> FstReader<R> {
             UncompressGzipWrapper::None => {
                 let mut header_reader = HeaderReader::new(input);
                 header_reader.read(read_time_table)?;
-                let (input, meta) = header_reader.into_input_and_meta_data().unwrap();
+                let (input, meta) = header_reader.into_input_and_meta_data()?;
                 Ok(FstReader {
                     input: InputVariant::Original(input),
                     meta,
@@ -109,7 +109,7 @@ impl<R: BufRead + Seek> FstReader<R> {
             UncompressGzipWrapper::InMemory(uc) => {
                 let mut header_reader = HeaderReader::new(uc);
                 header_reader.read(read_time_table)?;
-                let (uc2, meta) = header_reader.into_input_and_meta_data().unwrap();
+                let (uc2, meta) = header_reader.into_input_and_meta_data()?;
                 Ok(FstReader {
                     input: InputVariant::UncompressedInMem(uc2),
                     meta,
@@ -192,7 +192,7 @@ impl<R: BufRead + Seek> FstReader<R> {
         // at offset 0. The file itself can have a hierarchy block with another compression and
         // offset. The metadata of that block does not apply to the external file.
         header_reader.hierarchy = Some((HierarchyCompression::Uncompressed, 0));
-        Ok(header_reader.into_input_and_meta_data().unwrap())
+        header_reader.into_input_and_meta_data()
     }
 
     pub fn get_header(&self) -> FstHeader {
@@ -284,9 +284,7 @@ impl<R: BufRead + Seek> FstReader<R> {
     ///
     /// Returns an error for a bad handle count, section layout, chain length, or chain alias.
     /// The frame stays compressed, so a damaged frame is an error only in
-    /// [`crate::FstSection::for_each_frame_value`]. The helpers that read the time table and the
-    /// chain can still panic on other kinds of damage. Examples are a time table that is larger
-    /// than its section, and a chain with an offset delta of zero.
+    /// [`crate::FstSection::for_each_frame_value`]. Damaged time tables and chains return errors.
     pub fn read_section(&mut self, index: usize) -> Result<crate::FstSection> {
         let section = self.meta.data_sections.get(index).cloned().ok_or_else(|| {
             ReaderError::Io(std::io::Error::new(
@@ -350,7 +348,16 @@ fn internal_check_fst_file(input: &mut (impl Read + Seek)) -> Result<bool> {
             }
             _ => {}
         }
-        input.seek(SeekFrom::Current((section_length as i64) - 8))?;
+        let skip_length = i64::try_from(section_length)
+            .ok()
+            .and_then(|length| length.checked_sub(8))
+            .ok_or_else(|| {
+                ReaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "block length is too large",
+                ))
+            })?;
+        input.seek(SeekFrom::Current(skip_length))?;
     }
     Ok(seen_header)
 }
@@ -429,11 +436,8 @@ fn decompress_gz_in_chunks(
     let mut buf_in_remaining = 0;
     while remaining > 0 {
         // load more bytes into the input buffer
-        buf_in_remaining += input.read(&mut buf_in[buf_in_remaining..])?;
-        debug_assert!(
-            buf_in_remaining > 0,
-            "ran out of input data while gzip decompressing"
-        );
+        let read = input.read(&mut buf_in[buf_in_remaining..])?;
+        buf_in_remaining += read;
 
         // decompress them
         let res = miniz_oxide::inflate::stream::inflate(
@@ -445,6 +449,16 @@ fn decompress_gz_in_chunks(
 
         match res.status {
             Ok(status) => {
+                if read == 0
+                    && res.bytes_consumed == 0
+                    && res.bytes_written == 0
+                    && status == miniz_oxide::MZStatus::Ok
+                {
+                    return Err(ReaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "ran out of input data while gzip decompressing",
+                    )));
+                }
                 // move bytes that were not consumed to the start of the buffer and update the length
                 buf_in.copy_within(res.bytes_consumed..buf_in_remaining, 0);
                 buf_in_remaining -= res.bytes_consumed;
@@ -459,11 +473,20 @@ fn decompress_gz_in_chunks(
                         // nothing to do
                     }
                     miniz_oxide::MZStatus::StreamEnd => {
-                        debug_assert_eq!(remaining, 0);
-                        return Ok(());
+                        return if remaining == 0 {
+                            Ok(())
+                        } else {
+                            Err(ReaderError::Io(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "gzip stream ended before the declared output length",
+                            )))
+                        };
                     }
                     miniz_oxide::MZStatus::NeedDict => {
-                        todo!("hande NeedDict status");
+                        return Err(ReaderError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "gzip stream requires an unsupported dictionary",
+                        )));
                     }
                 }
             }
@@ -587,9 +610,25 @@ impl<R: Read + Seek> HeaderReader<R> {
     }
 
     fn skip(&mut self, section_length: u64, already_read: i64) -> Result<u64> {
-        Ok(self
-            .input
-            .seek(SeekFrom::Current((section_length as i64) - already_read))?)
+        let section_length = i64::try_from(section_length).map_err(|_| {
+            ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "section length is too large",
+            ))
+        })?;
+        let remaining = section_length.checked_sub(already_read).ok_or_else(|| {
+            ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "section length is inconsistent",
+            ))
+        })?;
+        if remaining < 0 {
+            return Err(ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "section length is shorter than its header",
+            )));
+        }
+        Ok(self.input.seek(SeekFrom::Current(remaining))?)
     }
 
     fn read_hierarchy(&mut self, compression: HierarchyCompression) -> Result<()> {
@@ -597,10 +636,12 @@ impl<R: Read + Seek> HeaderReader<R> {
         // this is the data section
         let section_length = read_u64(&mut self.input)?;
         self.skip(section_length, 8)?;
-        assert!(
-            self.hierarchy.is_none(),
-            "Only a single hierarchy block is expected!"
-        );
+        if self.hierarchy.is_some() {
+            return Err(ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "multiple hierarchy blocks are not supported",
+            )));
+        }
         self.hierarchy = Some((compression, file_offset));
         Ok(())
     }
@@ -673,7 +714,12 @@ impl<R: Read + Seek> HeaderReader<R> {
                 BlockType::Hierarchy => self.read_hierarchy(HierarchyCompression::ZLib)?,
                 BlockType::HierarchyLZ4 => self.read_hierarchy(HierarchyCompression::Lz4)?,
                 BlockType::HierarchyLZ4Duo => self.read_hierarchy(HierarchyCompression::Lz4Duo)?,
-                BlockType::GZipWrapper => panic!("GZip Wrapper should have been handled earlier!"),
+                BlockType::GZipWrapper => {
+                    return Err(ReaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "nested gzip wrapper is not supported",
+                    )));
+                }
                 BlockType::Skip => {
                     let section_length = read_u64(&mut self.input)?;
                     if section_length == 0 {
@@ -697,14 +743,23 @@ impl<R: Read + Seek> HeaderReader<R> {
 
     fn into_input_and_meta_data(mut self) -> Result<(R, MetaData)> {
         self.input.seek(SeekFrom::Start(0))?;
+        let header = self.header.ok_or_else(|| {
+            ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file has no header block",
+            ))
+        })?;
+        let signals = self.signals.ok_or_else(ReaderError::MissingGeometry)?;
+        let (hierarchy_compression, hierarchy_offset) =
+            self.hierarchy.ok_or_else(ReaderError::MissingHierarchy)?;
         let meta = MetaData {
-            header: self.header.unwrap(),
-            signals: self.signals.unwrap(),
+            header,
+            signals,
             blackouts: self.blackouts.unwrap_or_default(),
             data_sections: self.data_sections,
             float_endian: self.float_endian,
-            hierarchy_compression: self.hierarchy.unwrap().0,
-            hierarchy_offset: self.hierarchy.unwrap().1,
+            hierarchy_compression,
+            hierarchy_offset,
             time_table: self.time_table,
         };
         Ok((self.input, meta))
@@ -738,10 +793,30 @@ impl<
         time_table: &[u64],
     ) -> ReadSignalsResult<E> {
         let (max_handle, _) = read_variant_u64(&mut self.input)?;
+        if max_handle > self.meta.signals.len() as u64 {
+            return Err(ReaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the section has {max_handle} signal handles, but the file has {} signals",
+                    self.meta.signals.len()
+                ),
+            ))
+            .into());
+        }
         let vc_start = self.input.stream_position()?;
         let packtpe = ValueChangePackType::from_u8(read_u8(&mut self.input)?);
         // the chain length is right in front of the time section
-        let chain_len_offset = section_start + section_length - time_section_length - 8;
+        let chain_len_offset = section_start
+            .checked_add(section_length)
+            .and_then(|section_end| section_end.checked_sub(time_section_length))
+            .and_then(|offset| offset.checked_sub(8))
+            .filter(|&offset| offset >= vc_start)
+            .ok_or_else(|| {
+                ReaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid value-change chain offset",
+                ))
+            })?;
         let signal_offsets = read_signal_locs(
             &mut self.input,
             chain_len_offset,
@@ -774,13 +849,32 @@ impl<
                 };
 
                 // remember where we stored the signal data and how long it is
-                head_pointer[entry.signal_idx] = mu.len() as u32;
-                length_remaining[entry.signal_idx] = bytes.len() as u32;
+                let head = u32::try_from(mu.len()).map_err(|_| {
+                    ReaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "signal data buffer is too large",
+                    ))
+                })?;
+                let length = u32::try_from(bytes.len()).map_err(|_| {
+                    ReaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "signal value data is too large",
+                    ))
+                })?;
+                head_pointer[entry.signal_idx] = head;
+                length_remaining[entry.signal_idx] = length;
                 mu.append(&mut bytes);
 
                 // remember at what time step we will read this signal
-                scatter_pointer[entry.signal_idx] = tc_head[tdelta];
-                tc_head[tdelta] = entry.signal_idx as u32 + 1; // index to handle
+                let Some(head) = tc_head.get_mut(tdelta) else {
+                    return Err(ReaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("signal time delta {tdelta} is outside the time table"),
+                    ))
+                    .into());
+                };
+                scatter_pointer[entry.signal_idx] = *head;
+                *head = entry.signal_idx as u32 + 1; // index to handle
             }
         }
 
@@ -804,7 +898,13 @@ impl<
             // handles cannot be zero
             while tc_head[time_id] != 0 {
                 let signal_id = (tc_head[time_id] - 1) as usize; // convert handle to index
-                let mut mu_slice = &mu.as_slice()[head_pointer[signal_id] as usize..];
+                let head = head_pointer[signal_id] as usize;
+                let mut mu_slice = mu.get(head..).ok_or_else(|| {
+                    ReaderError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "signal data offset is outside its buffer",
+                    ))
+                })?;
                 let (vli, skiplen) = read_variant_u32(&mut mu_slice)?;
                 let signal_len = self.meta.signals[signal_id].len();
                 let signal_handle = FstSignalHandle::from_index(signal_id);
@@ -851,8 +951,22 @@ impl<
                 // update pointers
                 let total_skiplen = skiplen + len;
                 // advance "slice" for signal values
-                head_pointer[signal_id] += total_skiplen;
-                length_remaining[signal_id] -= total_skiplen;
+                head_pointer[signal_id] = head_pointer[signal_id]
+                    .checked_add(total_skiplen)
+                    .ok_or_else(|| {
+                        ReaderError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "signal data offset overflows",
+                        ))
+                    })?;
+                length_remaining[signal_id] = length_remaining[signal_id]
+                    .checked_sub(total_skiplen)
+                    .ok_or_else(|| {
+                        ReaderError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "signal data length is inconsistent",
+                        ))
+                    })?;
                 // find the next signal to read in this time step
                 tc_head[time_id] = scatter_pointer[signal_id];
                 // invalidate pointer
@@ -867,8 +981,21 @@ impl<
                     };
 
                     // point to the next time step
-                    scatter_pointer[signal_id] = tc_head[time_id + tdelta];
-                    tc_head[time_id + tdelta] = (signal_id + 1) as u32; // store handle
+                    let next_time = time_id.checked_add(tdelta).ok_or_else(|| {
+                        ReaderError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "signal time delta overflows",
+                        ))
+                    })?;
+                    let Some(next_head) = tc_head.get_mut(next_time) else {
+                        return Err(ReaderError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("signal time delta {tdelta} is outside the time table"),
+                        ))
+                        .into());
+                    };
+                    scatter_pointer[signal_id] = *next_head;
+                    *next_head = (signal_id + 1) as u32; // store handle
                 }
             }
         }
@@ -890,8 +1017,13 @@ impl<
             // verify meta-data
             let start_time = read_u64(&mut self.input)?;
             let end_time = read_u64(&mut self.input)?;
-            assert_eq!(start_time, section.start_time);
-            assert_eq!(end_time, section.end_time);
+            if start_time != section.start_time || end_time != section.end_time {
+                return Err(ReaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "data section time bounds do not match the section index",
+                ))
+                .into());
+            }
             let is_first_section = sec_num == 0;
 
             // read the time table
@@ -925,5 +1057,89 @@ impl<
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::*;
+    use crate::types::{FileType, Header, HierarchyCompression};
+
+    fn header() -> Header {
+        Header {
+            start_time: 0,
+            end_time: 0,
+            memory_used_by_writer: 0,
+            scope_count: 0,
+            var_count: 0,
+            max_var_id_code: 0,
+            vc_section_count: 0,
+            timescale_exponent: 0,
+            version: String::new(),
+            date: String::new(),
+            file_type: FileType::Verilog,
+            time_zero: 0,
+        }
+    }
+
+    #[test]
+    fn metadata_without_a_header_returns_an_error() {
+        let mut reader = HeaderReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        reader.signals = Some(Vec::new());
+        reader.hierarchy = Some((HierarchyCompression::Uncompressed, 0));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reader.into_input_and_meta_data()
+            }))
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn corrupt_chain_bounds_return_an_error_without_panicking() {
+        let meta = MetaData {
+            header: header(),
+            signals: Vec::new(),
+            blackouts: Vec::new(),
+            data_sections: Vec::new(),
+            float_endian: FloatingPointEndian::Little,
+            hierarchy_compression: HierarchyCompression::Uncompressed,
+            hierarchy_offset: 0,
+            time_table: None,
+        };
+        let filter = DataFilter {
+            start: 0,
+            end: u64::MAX,
+            signals: BitMask::repeat(false, 0),
+        };
+        let mut input = std::io::Cursor::new(vec![0, b'Z']);
+        let mut callback = |_: u64, _: FstSignalHandle, _: FstSignalValue<'_>| Ok::<_, ()>(());
+        let mut reader = DataReader {
+            input: &mut input,
+            meta: &meta,
+            filter: &filter,
+            callback: &mut callback,
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reader.read_value_changes(DataSectionKind::Standard, 0, 24, 24, &[])
+            }))
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fst_signature_scan_checks_large_skip_lengths() {
+        let mut bytes = vec![BlockType::Skip as u8];
+        bytes.extend_from_slice(&(i64::MAX as u64 + 1).to_be_bytes());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                internal_check_fst_file(&mut std::io::Cursor::new(bytes))
+            }))
+            .unwrap()
+            .is_err()
+        );
     }
 }

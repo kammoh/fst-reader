@@ -300,7 +300,9 @@ fn write_c_str_fixed_length(
 ) -> WriteResult<()> {
     let bytes = value.as_bytes();
     if bytes.len() >= max_len {
-        todo!("Return error.")
+        return Err(invalid_data(
+            "fixed-length string does not leave room for a terminator".into(),
+        ));
     }
     output.write_all(bytes)?;
     let zeros = vec![0u8; max_len - bytes.len()];
@@ -361,18 +363,22 @@ pub(crate) fn read_zlib_compressed_bytes(
     compressed_length: u64,
     allow_uncompressed: bool,
 ) -> ReadResult<Vec<u8>> {
+    let uncompressed_length = usize::try_from(uncompressed_length)
+        .map_err(|_| invalid_data("uncompressed data length is too large".into()))?;
+    let compressed_length = usize::try_from(compressed_length)
+        .map_err(|_| invalid_data("compressed data length is too large".into()))?;
     let bytes = if uncompressed_length == compressed_length && allow_uncompressed {
-        read_bytes(input, compressed_length as usize)?
+        read_bytes(input, compressed_length)?
     } else {
         // The decoder checks the zlib header, so we do not have to.
-        let compressed = read_bytes(input, compressed_length as usize)?;
+        let compressed = read_bytes(input, compressed_length)?;
 
         miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
             compressed.as_slice(),
-            uncompressed_length as usize,
+            uncompressed_length,
         )?
     };
-    check_uncompressed_length(bytes.len(), uncompressed_length)?;
+    check_uncompressed_length(bytes.len(), uncompressed_length as u64)?;
     Ok(bytes)
 }
 
@@ -398,7 +404,8 @@ pub(crate) fn write_compressed_bytes(
 
 #[inline]
 pub(crate) fn read_bytes(input: &mut impl Read, len: usize) -> ReadResult<Vec<u8>> {
-    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    // Cap the reserve because the length comes from an untrusted file.
+    let mut buf: Vec<u8> = Vec::with_capacity(len.min(1 << 20));
     input.take(len as u64).read_to_end(&mut buf)?;
     Ok(buf)
 }
@@ -422,7 +429,9 @@ pub(crate) fn determine_f64_endian(
     if be == needle {
         Ok(FloatingPointEndian::Big)
     } else {
-        todo!("should not get here")
+        Err(invalid_data(
+            "floating-point endian marker does not match either byte order".into(),
+        ))
     }
 }
 
@@ -451,6 +460,14 @@ fn read_lz4_compressed_bytes(
     compressed_length: usize,
 ) -> ReadResult<Vec<u8>> {
     let compressed = read_bytes(input, compressed_length)?;
+    // An LZ4 block needs a token and length bytes to encode each literal run. The
+    // format's maximum expansion is bounded by 255 times the input plus 64 bytes.
+    let max_uncompressed = compressed.len().saturating_mul(255).saturating_add(64);
+    if uncompressed_length > max_uncompressed {
+        return Err(invalid_data(format!(
+            "LZ4 output length {uncompressed_length} exceeds the {max_uncompressed}-byte expansion limit"
+        )));
+    }
     let bytes = lz4_flex::decompress(&compressed, uncompressed_length)?;
     Ok(bytes)
 }
@@ -462,7 +479,11 @@ const HEADER_VERSION_MAX_LEN: usize = 128;
 const HEADER_DATE_MAX_LEN: usize = 119;
 pub(crate) fn read_header(input: &mut impl Read) -> ReadResult<(Header, FloatingPointEndian)> {
     let section_length = read_u64(input)?;
-    assert_eq!(section_length, HEADER_LENGTH);
+    if section_length != HEADER_LENGTH {
+        return Err(invalid_data(format!(
+            "header length is {section_length}, expected {HEADER_LENGTH}"
+        )));
+    }
     let start_time = read_u64(input)?;
     let end_time = read_u64(input)?;
     let float_endian = determine_f64_endian(input, DOUBLE_ENDIAN_TEST)?;
@@ -520,11 +541,16 @@ pub(crate) fn read_geometry(input: &mut (impl Read + Seek)) -> ReadResult<Vec<Si
     let section_length = read_u64(input)?;
     let uncompressed_length = read_u64(input)?;
     let max_handle = read_u64(input)?;
-    let compressed_length = section_length - 3 * 8;
+    let compressed_length = section_length
+        .checked_sub(3 * 8)
+        .ok_or_else(|| invalid_data("geometry section is shorter than its header".into()))?;
 
     let bytes = read_zlib_compressed_bytes(input, uncompressed_length, compressed_length, true)?;
 
-    let mut signals: Vec<SignalInfo> = Vec::with_capacity(max_handle as usize);
+    let reserve = usize::try_from(max_handle)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let mut signals: Vec<SignalInfo> = Vec::with_capacity(reserve);
     let mut byte_reader: &[u8] = &bytes;
 
     for _ii in 0..max_handle {
@@ -574,12 +600,14 @@ pub(crate) fn read_blackout(input: &mut (impl Read + Seek)) -> ReadResult<Vec<Bl
     let start = input.stream_position()?;
     let section_length = read_u64(input)?;
     let (num_blackouts, _) = read_variant_u32(input)?;
-    let mut blackouts = Vec::with_capacity(num_blackouts as usize);
+    let mut blackouts = Vec::with_capacity((num_blackouts as usize).min(1 << 20));
     let mut current_blackout = 0u64;
     for _ in 0..num_blackouts {
         let activity = read_u8(input)? != 0;
         let (delta, _) = read_variant_u64(input)?;
-        current_blackout += delta;
+        current_blackout = current_blackout
+            .checked_add(delta)
+            .ok_or_else(|| invalid_data("blackout time overflows u64".into()))?;
         let bo = BlackoutData {
             time: current_blackout,
             contains_activity: activity,
@@ -587,7 +615,14 @@ pub(crate) fn read_blackout(input: &mut (impl Read + Seek)) -> ReadResult<Vec<Bl
         blackouts.push(bo);
     }
     let end = input.stream_position()?;
-    assert_eq!(start + section_length, end);
+    let expected_end = start
+        .checked_add(section_length)
+        .ok_or_else(|| invalid_data("blackout section end overflows".into()))?;
+    if expected_end != end {
+        return Err(invalid_data(
+            "blackout section length is inconsistent".into(),
+        ));
+    }
     Ok(blackouts)
 }
 
@@ -631,9 +666,19 @@ fn read_gzip_compressed_bytes(
     uncompressed_len: usize,
     compressed_len: usize,
 ) -> ReadResult<Vec<u8>> {
+    if compressed_len < 10 {
+        return Err(invalid_data(
+            "gzip block is shorter than its 10-byte header".into(),
+        ));
+    }
     read_gzip_header(input)?;
     // we do not care about other header bytes
-    let data = read_bytes(input, compressed_len - 10)?;
+    let data = read_bytes(
+        input,
+        compressed_len.checked_sub(10).ok_or_else(|| {
+            invalid_data("gzip compressed length is shorter than its header".into())
+        })?,
+    )?;
     let uncompressed =
         miniz_oxide::inflate::decompress_to_vec_with_limit(data.as_slice(), uncompressed_len)?;
     check_uncompressed_length(uncompressed.len(), uncompressed_len as u64)?;
@@ -642,6 +687,12 @@ fn read_gzip_compressed_bytes(
 
 pub(crate) fn read_gzip_header(input: &mut impl Read) -> ReadResult<()> {
     let header = read_bytes(input, 10)?;
+    if header.len() < 10 {
+        return Err(ReaderError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "gzip header is shorter than 10 bytes",
+        )));
+    }
     let correct_magic = header[0] == 0x1f && header[1] == 0x8b;
     if !correct_magic {
         return Err(ReaderError::GZipHeader(format!(
@@ -675,9 +726,13 @@ pub(crate) fn read_hierarchy_bytes(
             buf
         }
         _ => {
-            let section_length = read_u64(input)? as usize;
-            let uncompressed_length = read_u64(input)? as usize;
-            let compressed_length = section_length - 2 * 8;
+            let section_length = usize::try_from(read_u64(input)?)
+                .map_err(|_| invalid_data("hierarchy section length is too large".into()))?;
+            let uncompressed_length = usize::try_from(read_u64(input)?)
+                .map_err(|_| invalid_data("hierarchy output length is too large".into()))?;
+            let compressed_length = section_length.checked_sub(2 * 8).ok_or_else(|| {
+                invalid_data("hierarchy section is shorter than its length fields".into())
+            })?;
             let bytes = match compression {
                 HierarchyCompression::Uncompressed => unreachable!(),
                 HierarchyCompression::ZLib => {
@@ -689,9 +744,13 @@ pub(crate) fn read_hierarchy_bytes(
                 HierarchyCompression::Lz4Duo => {
                     // the length after the _first_ decompression
                     let (len, skiplen) = read_variant_u64(input)?;
-                    let lvl1_len = len as usize;
-                    let lvl1 =
-                        read_lz4_compressed_bytes(input, lvl1_len, compressed_length - skiplen)?;
+                    let lvl1_len = usize::try_from(len).map_err(|_| {
+                        invalid_data("hierarchy level-one length is too large".into())
+                    })?;
+                    let lvl1_compressed_len = compressed_length
+                        .checked_sub(skiplen)
+                        .ok_or_else(|| invalid_data("invalid LZ4 duo prefix length".into()))?;
+                    let lvl1 = read_lz4_compressed_bytes(input, lvl1_len, lvl1_compressed_len)?;
                     let mut lvl1_reader = lvl1.as_slice();
                     read_lz4_compressed_bytes(&mut lvl1_reader, uncompressed_length, lvl1_len)?
                 }
@@ -781,7 +840,9 @@ fn enum_table_from_string(value: String, handle: u64) -> ReadResult<FstHierarchy
     }
     let name = parts[0].to_string();
     let element_count = parts[1].parse::<usize>()?;
-    let expected_part_len = element_count * 2;
+    let expected_part_len = element_count
+        .checked_mul(2)
+        .ok_or_else(|| invalid_data("enum table element count is too large".into()))?;
     if parts.len() - 2 != expected_part_len {
         return Err(ReaderError::EnumTableString(
             format!(
@@ -834,7 +895,11 @@ fn parse_misc_attribute(
 ) -> ReadResult<FstHierarchyEntry> {
     let res = match tpe {
         MiscType::Comment => FstHierarchyEntry::Comment { string: name },
-        MiscType::EnvVar => todo!("EnvVar Attribute"), // fstWriterSetEnvVar()
+        MiscType::EnvVar => {
+            return Err(invalid_data(
+                "unsupported environment variable attribute".into(),
+            ));
+        }
         MiscType::SupVar => {
             // This attribute supplies VHDL specific information and is used by GHDL
             let var_type = (arg >> FST_SUP_VAR_DATA_TYPE_BITS) as u8;
@@ -848,15 +913,17 @@ fn parse_misc_attribute(
         MiscType::PathName => FstHierarchyEntry::PathName { name, id: arg },
         MiscType::SourceStem => FstHierarchyEntry::SourceStem {
             is_instantiation: false,
-            path_id: arg2.unwrap(),
+            path_id: arg2.ok_or_else(|| invalid_data("source stem has no path id".into()))?,
             line: arg,
         },
         MiscType::SourceInstantiationStem => FstHierarchyEntry::SourceStem {
             is_instantiation: true,
-            path_id: arg2.unwrap(),
+            path_id: arg2.ok_or_else(|| invalid_data("source stem has no path id".into()))?,
             line: arg,
         },
-        MiscType::ValueList => todo!("ValueList Attribute"), // fstWriterSetValueList()
+        MiscType::ValueList => {
+            return Err(invalid_data("unsupported value-list attribute".into()));
+        }
         MiscType::EnumTable => {
             if name.is_empty() {
                 FstHierarchyEntry::EnumTableRef { handle: arg }
@@ -864,7 +931,7 @@ fn parse_misc_attribute(
                 enum_table_from_string(name, arg)?
             }
         }
-        MiscType::Unknown => todo!("unknown Attribute"),
+        MiscType::Unknown => return Err(invalid_data("unknown misc attribute type".into())),
     };
     Ok(res)
 }
@@ -872,7 +939,11 @@ fn parse_misc_attribute(
 fn read_hierarchy_attribute_arg2_encoded_as_name(input: &mut impl Read) -> ReadResult<u64> {
     let (value, _) = read_variant_u64(input)?;
     let end_byte = read_u8(input)?;
-    assert_eq!(end_byte, 0, "expected to be zero terminated!");
+    if end_byte != 0 {
+        return Err(invalid_data(
+            "hierarchy attribute is not zero terminated".into(),
+        ));
+    }
     Ok(value)
 }
 
@@ -909,7 +980,10 @@ pub(crate) fn read_hierarchy_entry(
             let (raw_length, _) = read_variant_u32(input)?;
             let length = if tpe == FstVarType::Port {
                 // remove delimiting spaces and adjust signal size
-                (raw_length - 2) / 3
+                raw_length
+                    .checked_sub(2)
+                    .ok_or_else(|| invalid_data("port variable length is invalid".into()))?
+                    / 3
             } else {
                 raw_length
             };
@@ -994,7 +1068,11 @@ pub(crate) fn read_hierarchy_entry(
             FstHierarchyEntry::AttributeEnd
         }
 
-        other => todo!("Deal with hierarchy entry of type: {other}"),
+        other => {
+            return Err(invalid_data(format!(
+                "unknown hierarchy entry type: {other}"
+            )));
+        }
     };
 
     Ok(Some(entry))
@@ -1259,23 +1337,50 @@ pub(crate) fn read_time_table(
     section_start: u64,
     section_length: u64,
 ) -> ReadResult<(u64, Vec<u64>)> {
+    let trailer_length = 3 * 8;
+    if section_length < trailer_length {
+        return Err(invalid_data(format!(
+            "time table section is shorter than its {trailer_length}-byte trailer"
+        )));
+    }
+    let trailer_start = section_start
+        .checked_add(section_length - trailer_length)
+        .ok_or_else(|| invalid_data("time table section end overflows".into()))?;
     // the time block meta data is in the last 24 bytes at the end of the section
-    input.seek(SeekFrom::Start(section_start + section_length - 3 * 8))?;
+    input.seek(SeekFrom::Start(trailer_start))?;
     let uncompressed_length = read_u64(input)?;
     let compressed_length = read_u64(input)?;
     let number_of_items = read_u64(input)?;
-    assert!(compressed_length <= section_length);
+    let table_data_limit = section_length - trailer_length;
+    if compressed_length > table_data_limit {
+        return Err(invalid_data(format!(
+            "compressed time table length {compressed_length} exceeds section data length {table_data_limit}"
+        )));
+    }
+    if number_of_items > uncompressed_length {
+        return Err(invalid_data(format!(
+            "time table item count {number_of_items} exceeds its {uncompressed_length}-byte data"
+        )));
+    }
 
     // now that we know how long the block actually is, we can go back to it
-    input.seek(SeekFrom::Current(-(3 * 8) - (compressed_length as i64)))?;
+    let table_start = trailer_start
+        .checked_sub(compressed_length)
+        .ok_or_else(|| invalid_data("time table starts before its section".into()))?;
+    input.seek(SeekFrom::Start(table_start))?;
     let bytes = read_zlib_compressed_bytes(input, uncompressed_length, compressed_length, true)?;
     let mut byte_reader: &[u8] = &bytes;
-    let mut time_table: Vec<u64> = Vec::with_capacity(number_of_items as usize);
+    let reserve = usize::try_from(number_of_items)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let mut time_table: Vec<u64> = Vec::with_capacity(reserve);
     let mut time_val: u64 = 0; // running time counter
 
     for _ in 0..number_of_items {
         let (value, _) = read_variant_u64(&mut byte_reader)?;
-        time_val += value;
+        time_val = time_val
+            .checked_add(value)
+            .ok_or_else(|| invalid_data("time table value overflows u64".into()))?;
         time_table.push(time_val);
     }
 
@@ -1347,12 +1452,23 @@ pub(crate) fn read_frame<E>(
     let (uncompressed_length, _) = read_variant_u64(input)?;
     let (compressed_length, _) = read_variant_u64(input)?;
     let (max_handle, _) = read_variant_u64(input)?;
-    assert!(compressed_length <= section_length);
+    if compressed_length > section_length {
+        return Err(invalid_data(format!(
+            "compressed frame length {compressed_length} exceeds section length {section_length}"
+        ))
+        .into());
+    }
     let bytes_vec =
         read_zlib_compressed_bytes(input, uncompressed_length, compressed_length, true)?;
     let mut bytes = std::io::Cursor::new(bytes_vec);
 
-    assert_eq!(signals.len(), max_handle as usize);
+    if signals.len() != max_handle as usize {
+        return Err(invalid_data(format!(
+            "frame has {max_handle} handles, but geometry has {} signals",
+            signals.len()
+        ))
+        .into());
+    }
     for (idx, signal) in signals.iter().enumerate() {
         let signal_length = signal.len();
         if signal_filter.is_set(idx) {
@@ -1433,17 +1549,17 @@ impl OffsetTable {
     }
 
     fn get_entry(&self, signal_idx: usize) -> Option<OffsetEntry> {
-        match &self.0[signal_idx] {
+        match self.0.get(signal_idx)? {
             SignalDataLoc::None => None,
             // aliases should always directly point to an offset,
             // so we should not have to recurse! `OffsetTable::new` checks this.
-            SignalDataLoc::Alias(alias_idx) => match &self.0[*alias_idx as usize] {
+            SignalDataLoc::Alias(alias_idx) => match self.0.get(*alias_idx as usize)? {
                 SignalDataLoc::Offset(offset, len) => Some(OffsetEntry {
                     signal_idx,
                     offset: offset.get() as u64,
                     len: len.get(),
                 }),
-                _ => unreachable!("aliases should always directly point to an offset"),
+                _ => None,
             },
             SignalDataLoc::Offset(offset, len) => Some(OffsetEntry {
                 signal_idx,
@@ -1483,7 +1599,6 @@ impl Iterator for OffsetTableIter<'_> {
 
         // read out result
         let res = self.table.get_entry(self.signal_idx);
-        debug_assert!(res.is_some());
 
         // increment id for next call
         self.signal_idx += 1;
@@ -1498,7 +1613,9 @@ fn read_value_change_alias2(
     max_handle: u64,
     last_table_entry: u32,
 ) -> ReadResult<OffsetTable> {
-    let mut table = vec![SignalDataLoc::None; max_handle as usize];
+    let table_len = usize::try_from(max_handle)
+        .map_err(|_| invalid_data("signal handle count is too large".into()))?;
+    let mut table = vec![SignalDataLoc::None; table_len];
     let mut idx = 0_usize;
     let mut offset: Option<NonZeroU32> = None;
     let mut prev_alias = 0u32;
@@ -1510,47 +1627,81 @@ fn read_value_change_alias2(
             match shval.cmp(&0) {
                 Ordering::Greater => {
                     // a new incremental offset
-                    let new_offset = NonZeroU32::new(
-                        (offset.map(|o| o.get()).unwrap_or_default() as i64 + shval) as u32,
-                    )
-                    .unwrap();
+                    let previous = offset.map(|o| o.get() as i64).unwrap_or_default();
+                    let value = previous
+                        .checked_add(shval)
+                        .ok_or_else(|| invalid_data("signal data offset overflows".into()))?;
+                    let value = u32::try_from(value)
+                        .ok()
+                        .and_then(NonZeroU32::new)
+                        .ok_or_else(|| invalid_data("signal data offset is invalid".into()))?;
                     // if there was a previous entry, we need to update the length
                     if let Some(prev_offset) = offset {
-                        let len = NonZeroU32::new(new_offset.get() - prev_offset.get()).unwrap();
-                        table[prev_offset_idx] = SignalDataLoc::Offset(prev_offset, len);
+                        let len = value
+                            .get()
+                            .checked_sub(prev_offset.get())
+                            .and_then(NonZeroU32::new)
+                            .ok_or_else(|| invalid_data("signal data length is invalid".into()))?;
+                        *table.get_mut(prev_offset_idx).ok_or_else(|| {
+                            invalid_data("signal index exceeds handle count".into())
+                        })? = SignalDataLoc::Offset(prev_offset, len);
                     }
-                    offset = Some(new_offset);
+                    offset = Some(value);
                     prev_offset_idx = idx;
                     // increase index, value will be replaced as soon as we know the length
-                    idx += 1;
+                    idx = checked_next_signal_index(idx, table.len())?;
                 }
                 Ordering::Less => {
                     // new signal alias
-                    prev_alias = (-shval - 1) as u32;
-                    table[idx] = SignalDataLoc::Alias(prev_alias);
-                    idx += 1;
+                    prev_alias = shval
+                        .checked_neg()
+                        .and_then(|value| value.checked_sub(1))
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| invalid_data("signal alias index is invalid".into()))?;
+                    *table.get_mut(idx).ok_or_else(|| {
+                        invalid_data("signal index exceeds handle count".into())
+                    })? = SignalDataLoc::Alias(prev_alias);
+                    idx = checked_next_signal_index(idx, table.len())?;
                 }
                 Ordering::Equal => {
                     // same signal alias as previous signal
-                    table[idx] = SignalDataLoc::Alias(prev_alias);
-                    idx += 1;
+                    *table.get_mut(idx).ok_or_else(|| {
+                        invalid_data("signal index exceeds handle count".into())
+                    })? = SignalDataLoc::Alias(prev_alias);
+                    idx = checked_next_signal_index(idx, table.len())?;
                 }
             }
         } else {
             // a block of signals that do not have any data
             let (value, _) = read_variant_u32(&mut chain_bytes)?;
             let zeros = value >> 1;
-            idx += zeros as usize;
+            let zeros = usize::try_from(zeros)
+                .map_err(|_| invalid_data("signal count is too large".into()))?;
+            idx = idx
+                .checked_add(zeros)
+                .filter(|&end| end <= table.len())
+                .ok_or_else(|| invalid_data("signal count exceeds handle count".into()))?;
         }
     }
 
     // if there was a previous entry, we need to update the length
     if let Some(prev_offset) = offset {
-        let len = NonZeroU32::new(last_table_entry - prev_offset.get()).unwrap();
-        table[prev_offset_idx] = SignalDataLoc::Offset(prev_offset, len);
+        let len = last_table_entry
+            .checked_sub(prev_offset.get())
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| invalid_data("signal data length is invalid".into()))?;
+        *table
+            .get_mut(prev_offset_idx)
+            .ok_or_else(|| invalid_data("signal index exceeds handle count".into()))? =
+            SignalDataLoc::Offset(prev_offset, len);
     }
 
-    debug_assert_eq!(max_handle as usize, idx);
+    if idx != table.len() {
+        return Err(invalid_data(format!(
+            "signal chain describes {idx} handles, expected {}",
+            table.len()
+        )));
+    }
 
     OffsetTable::new(table)
 }
@@ -1560,7 +1711,9 @@ fn read_value_change_alias(
     max_handle: u64,
     last_table_entry: u32,
 ) -> ReadResult<OffsetTable> {
-    let mut table = Vec::with_capacity(max_handle as usize);
+    let capacity = usize::try_from(max_handle)
+        .map_err(|_| invalid_data("signal handle count is too large".into()))?;
+    let mut table = Vec::with_capacity(capacity);
     let mut prev_offset_idx = 0usize;
     let mut offset: Option<NonZeroU32> = None;
     while !chain_bytes.is_empty() {
@@ -1569,37 +1722,86 @@ fn read_value_change_alias(
         if raw_val == 0 {
             let (raw_alias, _) = read_variant_u32(&mut chain_bytes)?;
             let alias = ((raw_alias as i64) - 1) as u32;
-            table.push(SignalDataLoc::Alias(alias));
+            push_signal_loc(&mut table, capacity, SignalDataLoc::Alias(alias))?;
         } else if (raw_val & 1) == 1 {
             // a new incremental offset
-            let new_offset =
-                NonZeroU32::new(offset.map(|o| o.get()).unwrap_or_default() + (raw_val >> 1))
-                    .unwrap();
+            let value = offset
+                .map(|o| o.get())
+                .unwrap_or_default()
+                .checked_add(raw_val >> 1)
+                .ok_or_else(|| invalid_data("signal data offset overflows".into()))?;
+            let new_offset = NonZeroU32::new(value)
+                .ok_or_else(|| invalid_data("signal data offset is invalid".into()))?;
             // if there was a previous entry, we need to update the length
             if let Some(prev_offset) = offset {
-                let len = NonZeroU32::new(new_offset.get() - prev_offset.get()).unwrap();
-                table[prev_offset_idx] = SignalDataLoc::Offset(prev_offset, len);
+                let len = new_offset
+                    .get()
+                    .checked_sub(prev_offset.get())
+                    .and_then(NonZeroU32::new)
+                    .ok_or_else(|| invalid_data("signal data length is invalid".into()))?;
+                *table
+                    .get_mut(prev_offset_idx)
+                    .ok_or_else(|| invalid_data("signal index exceeds handle count".into()))? =
+                    SignalDataLoc::Offset(prev_offset, len);
             }
             offset = Some(new_offset);
             prev_offset_idx = idx;
             // push a placeholder which will be replaced as soon as we know the length
-            table.push(SignalDataLoc::None);
+            push_signal_loc(&mut table, capacity, SignalDataLoc::None)?;
         } else {
             // a block of signals that do not have any data
             let zeros = raw_val >> 1;
-            for _ in 0..zeros {
-                table.push(SignalDataLoc::None);
-            }
+            let zeros = usize::try_from(zeros)
+                .map_err(|_| invalid_data("signal count is too large".into()))?;
+            let end = table
+                .len()
+                .checked_add(zeros)
+                .filter(|&end| end <= capacity)
+                .ok_or_else(|| invalid_data("signal count exceeds handle count".into()))?;
+            table.resize(end, SignalDataLoc::None);
         }
     }
 
     // if there was a previous entry, we need to update the length
     if let Some(prev_offset) = offset {
-        let len = NonZeroU32::new(last_table_entry - prev_offset.get()).unwrap();
-        table[prev_offset_idx] = SignalDataLoc::Offset(prev_offset, len);
+        let len = last_table_entry
+            .checked_sub(prev_offset.get())
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| invalid_data("signal data length is invalid".into()))?;
+        *table
+            .get_mut(prev_offset_idx)
+            .ok_or_else(|| invalid_data("signal index exceeds handle count".into()))? =
+            SignalDataLoc::Offset(prev_offset, len);
     }
 
+    if table.len() > capacity {
+        return Err(invalid_data(format!(
+            "signal chain describes {} handles, more than {capacity}",
+            table.len()
+        )));
+    }
+    table.resize(capacity, SignalDataLoc::None);
+
     OffsetTable::new(table)
+}
+
+fn checked_next_signal_index(index: usize, limit: usize) -> ReadResult<usize> {
+    index
+        .checked_add(1)
+        .filter(|&next| next <= limit)
+        .ok_or_else(|| invalid_data("signal count exceeds handle count".into()))
+}
+
+fn push_signal_loc(
+    table: &mut Vec<SignalDataLoc>,
+    limit: usize,
+    loc: SignalDataLoc,
+) -> ReadResult<()> {
+    if table.len() >= limit {
+        return Err(invalid_data("signal count exceeds handle count".into()));
+    }
+    table.push(loc);
+    Ok(())
 }
 
 /// Indicates the location of the signal data for the current block.
@@ -1624,11 +1826,18 @@ pub(crate) fn read_signal_locs(
     let chain_compressed_length = read_u64(input)?;
 
     // the chain starts _chain_length_ bytes before the chain length
-    let chain_start = chain_len_offset - chain_compressed_length;
+    let chain_start = chain_len_offset
+        .checked_sub(chain_compressed_length)
+        .ok_or_else(|| invalid_data("signal chain starts before the file".into()))?;
     input.seek(SeekFrom::Start(chain_start))?;
-    let chain_bytes = read_bytes(input, chain_compressed_length as usize)?;
+    let chain_length = usize::try_from(chain_compressed_length)
+        .map_err(|_| invalid_data("signal chain is too large".into()))?;
+    let chain_bytes = read_bytes(input, chain_length)?;
 
-    let last_table_entry = (chain_start - start) as u32; // indx_pos - vc_start
+    let last_table_entry = chain_start
+        .checked_sub(start)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| invalid_data("signal chain offset is invalid".into()))?;
     if section_kind == DataSectionKind::DynamicAlias2 {
         read_value_change_alias2(&chain_bytes, max_handle, last_table_entry)
     } else {
@@ -1990,6 +2199,197 @@ mod tests {
             Err(ReaderError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {}
             other => panic!("expected an InvalidData error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn time_table_length_past_section_is_an_error() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // uncompressed length
+        bytes.extend_from_slice(&1u64.to_be_bytes()); // compressed length
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // item count
+        assert_invalid_data(read_time_table(&mut std::io::Cursor::new(bytes), 0, 3 * 8));
+    }
+
+    #[test]
+    fn signal_chains_reject_zero_offset_deltas() {
+        assert_invalid_data(read_value_change_alias(&[0x01], 1, 10));
+        assert_invalid_data(read_value_change_alias2(&[0x01], 1, 10));
+    }
+
+    #[test]
+    fn signal_chains_reject_handle_count_mismatches() {
+        assert_invalid_data(read_value_change_alias2(&[], 1, 10));
+    }
+
+    #[test]
+    fn standard_chain_may_omit_trailing_handles() {
+        let table = read_value_change_alias(&[], 1, 10).unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.iter().count(), 0);
+    }
+
+    #[test]
+    fn read_bytes_reserves_at_most_one_mib_up_front() {
+        let bytes = [7u8];
+        let result = read_bytes(&mut bytes.as_slice(), 2 * 1024 * 1024).unwrap();
+        assert!(result.capacity() >= 1024 * 1024);
+        assert!(result.capacity() <= 1024 * 1024);
+    }
+
+    #[test]
+    fn geometry_rejects_short_sections_and_huge_handle_counts() {
+        let short = [0u8; 24];
+        assert!(
+            std::panic::catch_unwind(|| read_geometry(&mut std::io::Cursor::new(short)))
+                .unwrap()
+                .is_err()
+        );
+
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&[0], 4);
+        let mut large_count = Vec::new();
+        large_count.extend_from_slice(&((compressed.len() + 24) as u64).to_be_bytes());
+        large_count.extend_from_slice(&1u64.to_be_bytes());
+        large_count.extend_from_slice(&u64::MAX.to_be_bytes());
+        large_count.extend_from_slice(&compressed);
+        assert!(
+            std::panic::catch_unwind(|| read_geometry(&mut std::io::Cursor::new(large_count)))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hierarchy_lengths_before_their_prefixes_are_errors() {
+        let short_section = [0u8; 16];
+        assert!(
+            std::panic::catch_unwind(|| {
+                read_hierarchy_bytes(
+                    &mut std::io::Cursor::new(short_section),
+                    HierarchyCompression::Lz4,
+                )
+            })
+            .unwrap()
+            .is_err()
+        );
+
+        let mut duo = Vec::new();
+        duo.extend_from_slice(&16u64.to_be_bytes());
+        duo.extend_from_slice(&0u64.to_be_bytes());
+        duo.push(1); // level-one length has a one-byte prefix
+        assert!(
+            std::panic::catch_unwind(|| {
+                read_hierarchy_bytes(&mut std::io::Cursor::new(duo), HierarchyCompression::Lz4Duo)
+            })
+            .unwrap()
+            .is_err()
+        );
+
+        let mut zlib = Vec::new();
+        zlib.extend_from_slice(&16u64.to_be_bytes());
+        zlib.extend_from_slice(&0u64.to_be_bytes());
+        zlib.extend_from_slice(&GZIP_HEADER);
+        assert!(
+            std::panic::catch_unwind(|| {
+                read_hierarchy_bytes(&mut std::io::Cursor::new(zlib), HierarchyCompression::ZLib)
+            })
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn lz4_rejects_output_above_the_block_expansion_bound() {
+        let result = read_lz4_compressed_bytes(&mut &[0u8][..], 1000, 1);
+        assert!(
+            matches!(result, Err(ReaderError::Io(ref e)) if e.kind() == std::io::ErrorKind::InvalidData)
+        );
+    }
+
+    #[test]
+    fn gzip_readers_reject_truncated_headers_and_short_compressed_lengths() {
+        let truncated_header =
+            std::panic::catch_unwind(|| read_gzip_header(&mut &[0x1f, 0x8b][..]))
+                .unwrap()
+                .unwrap_err();
+        assert!(matches!(
+            truncated_header,
+            ReaderError::Io(ref error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        let header = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0];
+        assert!(
+            std::panic::catch_unwind(|| { read_gzip_compressed_bytes(&mut &header[..], 0, 9) })
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn enum_table_size_overflow_is_an_error() {
+        let value = format!("t {}", usize::MAX);
+        assert!(
+            std::panic::catch_unwind(|| enum_table_from_string(value, 0))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn time_table_reserves_from_the_decoded_table_size() {
+        let mut buf = std::io::Cursor::new(vec![0u8; 64]);
+        write_time_table(&mut buf, None, &(0..10).collect::<Vec<_>>()).unwrap();
+        let section_length = buf.position();
+        buf.set_position(0);
+        let (_, table) = read_time_table(&mut buf, 0, section_length).unwrap();
+        assert_eq!(table.len(), 10);
+        assert_eq!(table.capacity(), 10);
+    }
+
+    #[test]
+    fn blackout_reader_reserves_from_the_declared_count_with_a_cap() {
+        let blackouts = (0..10)
+            .map(|time| BlackoutData {
+                time,
+                contains_activity: true,
+            })
+            .collect::<Vec<_>>();
+        let mut buf = std::io::Cursor::new(vec![0u8; 128]);
+        write_blackout(&mut buf, &blackouts).unwrap();
+        buf.set_position(0);
+        let actual = read_blackout(&mut buf).unwrap();
+        assert_eq!(actual, blackouts);
+        assert_eq!(actual.capacity(), blackouts.len());
+    }
+
+    #[test]
+    fn port_variable_length_underflow_is_an_error() {
+        let entry = [
+            FstVarType::Port as u8,
+            FstVarDirection::Implicit as u8,
+            0,
+            0,
+            0,
+        ];
+        let mut handle_count = 0;
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_hierarchy_entry(&mut &entry[..], &mut handle_count)
+            }))
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_hierarchy_entry_is_an_error() {
+        let mut handle_count = 0;
+        assert_invalid_data(read_hierarchy_entry(&mut &[42u8][..], &mut handle_count));
+    }
+
+    #[test]
+    fn read_bytes_caps_reserve_when_declared_length_exceeds_input() {
+        let bytes = read_bytes(&mut &[7u8][..], usize::MAX).unwrap();
+        assert_eq!(bytes, vec![7]);
+        assert_eq!(bytes.capacity(), 1 << 20);
     }
 
     /// The chain of a standard section (kind 1 and 2 in `read_value_change_alias`). A raw value
