@@ -410,6 +410,15 @@ pub(crate) fn read_bytes(input: &mut impl Read, len: usize) -> ReadResult<Vec<u8
     Ok(buf)
 }
 
+/// Like [`read_bytes`], but reserves all `len` bytes up front, so a large buffer is not
+/// reallocated while it grows. Use it only when the caller has checked that the file holds at
+/// least `len` more bytes, for example because a value after them was already read.
+pub(crate) fn read_bytes_in_file(input: &mut impl Read, len: usize) -> ReadResult<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    input.take(len as u64).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 pub(crate) fn read_block_tpe(input: &mut impl Read) -> ReadResult<BlockType> {
     Ok(BlockType::try_from(read_u8(input)?)?)
 }

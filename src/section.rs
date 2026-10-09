@@ -10,9 +10,10 @@
 
 use crate::FstSignalHandle;
 use crate::io::{
-    RCV_STR, ReadResult, ReaderError, invalid_data, multi_bit_digital_signal_to_chars, read_bytes,
-    read_f64, read_packed_signal_value_bytes, read_signal_locs, read_time_table, read_u8, read_u64,
-    read_variant_u32, read_variant_u64, read_zlib_compressed_bytes,
+    RCV_STR, ReadResult, ReaderError, invalid_data, multi_bit_digital_signal_to_chars,
+    read_bytes_in_file, read_f64, read_packed_signal_value_bytes, read_signal_locs,
+    read_time_table, read_u8, read_u64, read_variant_u32, read_variant_u64,
+    read_zlib_compressed_bytes,
 };
 use crate::types::{DataSectionInfo, FloatingPointEndian, SignalInfo, ValueChangePackType};
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -298,7 +299,9 @@ pub(crate) fn read_section(
             "the frame has {frame_compressed} bytes, but the section has {section_length}"
         )));
     }
-    let frame = read_bytes(input, frame_compressed as usize)?;
+    // `read_time_table` read the trailer at the end of the section, so the file holds the whole
+    // section, and `frame_compressed` is at most its length.
+    let frame = read_bytes_in_file(input, frame_compressed as usize)?;
 
     // value-change data follows the frame
     let (max_handle, _) = read_variant_u64(input)?;
@@ -330,7 +333,8 @@ pub(crate) fn read_section(
     }
     let offsets = read_signal_locs(input, chain_len_offset, section.kind, max_handle, vc_start)?;
     input.seek(SeekFrom::Start(vc_start))?;
-    let data = read_bytes(input, (chain_len_offset - vc_start) as usize)?;
+    // The chain length after this data was read above, so the file holds all of it.
+    let data = read_bytes_in_file(input, (chain_len_offset - vc_start) as usize)?;
 
     let mut locs = vec![None; max_handle as usize];
     for entry in offsets.iter() {
@@ -365,6 +369,27 @@ mod tests {
     use crate::io::read_variant_u64;
     use crate::types::{BlockType, DataSectionKind};
     use std::io::ErrorKind;
+
+    #[test]
+    fn section_buffers_are_reserved_exactly() {
+        // A buffer that grows while it is read can take twice its length. Check a file with a
+        // section larger than the 1 MiB reserve cap of `read_bytes`.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fsts/verilator/new_attributes_pull_24.fst");
+        let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let mut reader = FstReader::open_and_read_time_table(file).unwrap();
+        let mut largest = 0;
+        for index in 0..reader.sections().len() {
+            let section = reader.read_section(index).unwrap();
+            assert_eq!(section.data.capacity(), section.data.len());
+            assert_eq!(section.frame.capacity(), section.frame.len());
+            largest = largest.max(section.data.len());
+        }
+        assert!(
+            largest > 1 << 20,
+            "no section is larger than 1 MiB: {largest}"
+        );
+    }
 
     /// A section with one signal of `width` bits (0 means variable length) and `time_points`
     /// time table entries. The signal has one uncompressed chunk, which holds `change_bytes`.
