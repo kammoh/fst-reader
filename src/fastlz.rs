@@ -14,7 +14,9 @@ pub(crate) fn decompress(
     input_len: usize,
     output_size_hint: usize,
 ) -> ReadResult<Vec<u8>> {
-    let mut out = Vec::with_capacity(output_size_hint);
+    // The hint comes from the file: cap the reserve, so a corrupt value cannot request a huge
+    // allocation. The vector grows as needed past the cap.
+    let mut out = Vec::with_capacity(output_size_hint.min(1 << 20));
 
     let header = read_u8(input)?;
     let level = (header >> 5) + 1;
@@ -148,6 +150,14 @@ fn copy_match(out: &mut Vec<u8>, start: usize, length: usize) {
 mod tests {
     use super::*;
     use std::io::{Cursor, ErrorKind};
+
+    #[test]
+    fn a_huge_output_size_hint_does_not_reserve_it() {
+        // The hint comes from the file. A corrupt value must not cause a capacity overflow.
+        let mut input = Cursor::new(vec![0u8, b'a']);
+        let result = std::panic::catch_unwind(move || decompress(&mut input, 2, usize::MAX));
+        assert!(result.is_ok(), "decompress panicked");
+    }
 
     fn run(input: &[u8]) -> ReadResult<Vec<u8>> {
         decompress(&mut Cursor::new(input.to_vec()), input.len(), 16)

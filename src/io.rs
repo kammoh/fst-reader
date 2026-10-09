@@ -1696,13 +1696,8 @@ fn read_value_change_alias2(
             SignalDataLoc::Offset(prev_offset, len);
     }
 
-    if idx != table.len() {
-        return Err(invalid_data(format!(
-            "signal chain describes {idx} handles, expected {}",
-            table.len()
-        )));
-    }
-
+    // A chain may end before `max_handle`: the remaining handles keep `SignalDataLoc::None`, as
+    // in release builds of upstream. The checks above keep `idx` within the table.
     OffsetTable::new(table)
 }
 
@@ -2217,8 +2212,19 @@ mod tests {
     }
 
     #[test]
-    fn signal_chains_reject_handle_count_mismatches() {
-        assert_invalid_data(read_value_change_alias2(&[], 1, 10));
+    fn alias2_chain_may_omit_trailing_handles() {
+        // Release builds of upstream accept a chain that ends before `max_handle`.
+        let table = read_value_change_alias2(&[], 2, 10).unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.iter().count(), 0);
+        let table = read_value_change_alias2(&alias2_chain(&[1]), 2, 10).unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.iter().count(), 1);
+    }
+
+    #[test]
+    fn alias2_chain_with_more_handles_than_the_table_is_an_error() {
+        assert_invalid_data(read_value_change_alias2(&alias2_chain(&[1, 1, 1]), 2, 10));
     }
 
     #[test]
